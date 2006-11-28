@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# nzbperl.pl -- version 0.6.2
+# nzbperl.pl -- version 0.6.3
 # 
 # for more information:
 # http://noisybox.net/computers/nzbperl/ 
@@ -30,6 +30,8 @@
 #   * Other items listed on the project webpage :-)
 
 use strict;
+use threads;
+use Thread::Queue;
 use Socket;
 use XML::DOM;
 use Getopt::Long;
@@ -37,11 +39,12 @@ use Time::HiRes;	# timer stuff
 use Term::ReadKey;	# for no echo password reading
 use Term::Cap;
 
-my $version = '0.6.2';
+my $version = '0.6.3';
 my $ospeed;
 my $terminal = Tgetent Term::Cap { TERM => undef, OSPEED => $ospeed };
 my $recv_chunksize = 5*1024;	# How big of chunks we read at once from a connection (this is pulled from ass)
 my $DECODE_DBG_FILE = '/tmp/nzbdbgout.txt';
+my $UPDATE_URL = 'http://noisybox.net/computers/nzbperl/nzbperl_version.txt';
 
 my $dispchunkct = 250;			# Number of data lines to read between screen updates.
 my $targkBps = 0;
@@ -60,8 +63,10 @@ my $usecolor = 1;
 my $logfile;
 my ($server, $port, $user, $pw, $keepparts, $keepbroken, $keepbrokenbin, $help, $nosort, 
     $overwritefiles, $connct, $nocolor, $insane, 
-	$dropbad, $skipfilect, $reconndur, $filterregex, $configfile) =
-	('', 119, '', '', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 300, undef, "$ENV{HOME}/.nzbperlrc");
+	$dropbad, $skipfilect, $reconndur, $filterregex, 
+	$configfile, $uudeview, $daemon, $dlrelative, $dlpath, $noupdate) =
+	('', 119, '', '', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 300, undef, "$ENV{HOME}/.nzbperlrc", undef, 
+	0, undef, undef, 0);
 
 # How commandline args are mapped to vars.  This map is also used by config file processor
 my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw, 
@@ -72,24 +77,38 @@ my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw,
 				'nocolor' => \$nocolor, 'log=s' => \$logfile,
 				'insane' => \$insane, 'dropbad' => \$dropbad,
 				'skip=i' => \$skipfilect, 'retrywait=i' => \$reconndur,
-				'filter=s' => \$filterregex, 'config=s' => \$configfile);
+				'filter=s' => \$filterregex, 'config=s' => \$configfile,
+				'uudeview=s' => \$uudeview, 'daemon' => \$daemon,
+				'dlrelative' => \$dlrelative, 'dlpath=s' => \$dlpath, 'noupdate' => \$noupdate);
 
 handleCommandLineOptions();
 if(not $nocolor){
 	use Term::ANSIColor;
 }
+if(not haveUUDeview()){	# Verify that uudeview is installed
+	pc("* Please install and configure uudeview and try again.\n", "bold red");
+	exit 1;
+}
 
 displayShortGPL();
+checkForNewVersion();
 
 if($user and !$pw){
 	print "Password for '$user': ";
 	$pw = readPassword();
 }
 
-my $nzbfilename = $ARGV[0];
-my @suspectFileInd;
-my @fileset = parseNZB($nzbfilename, !$nosort);
+my @fileset;
+while(scalar(@ARGV) > 0){
+	my $nzbfilename = shift @ARGV; #$ARGV[0];
+	push @fileset, parseNZB($nzbfilename);
+}
+sortFilesBySubject();	# It checks $sort inside
+regexAndSkipping();		# It checks options inside too
 
+print "Looks like we've got " . scalar @fileset . " possible files ahead of us.\n";
+
+my @suspectFileInd;
 if($insane){
 }
 else{
@@ -133,7 +152,23 @@ if($user){
 	doLogins() or die "Error authenticating to server.\nPlease check the user/pass info and try again.";
 }
 
-$terminal->Tputs('cl', 1, *STDOUT);			# clears screen
+if($daemon){
+	print "nzbperl is running in --daemon mode, output suppressed\n";
+	print "Check log for additional details during run...\n";
+	my $pid = fork;
+	$pid and print "Daemon started [$pid]\n" and exit;
+	#close STDIN;
+	#close STDOUT;
+	#close STDERR;
+}
+
+# Start up the decoding thread...
+my $decMsgQ = Thread::Queue->new;	# For status msgs
+my $decQ = Thread::Queue->new;
+
+my $decThread = threads->new(\&file_decoder_thread);
+
+clearScreen();
 my ($oldwchar, $wchar, $hchar, $wpixels, $hpixels);  	# holds screen size info
 
 unlink $DECODE_DBG_FILE;  # Clean up on each run
@@ -159,31 +194,78 @@ while(1){
 			}
 		}
 		if($done){
-			$terminal->Tgoto('cm', 0, 1+5+(3*$connct)+9, *STDOUT);
-			print "All downloads complete!\n";
+			cursorPos(0, 1+5+(3*$connct)+9);
+			pc("All downloads complete!\n", 'bold white');
 			last;
 		}
 	}
 	$quitnow and last;
 }
 
-$terminal->Tgoto('cm', 0, (1+5+(3*$connct)+8), *STDOUT);
+cursorPos(0, (1+5+(3*$connct)+8));
 
 if($quitnow){# Do some cleanups
 	foreach my $c (@conn){
 		next unless $c->{'file'};
 		if($c->{'tmpfile'}){
-			print "Closing and deleting " . $c->{'tmpfilename'} . "...\n";
+			pc("Closing and deleting " . $c->{'tmpfilename'} . "...\n", 'bold white');
 			close $c->{'tmpfile'};
 			unlink $c->{'tmpfilename'};
 		}
 	}
 }
 disconnectAll();
+pc("Waiting for file decoding thread to terminate...\n", 'bold white');
+$decQ->enqueue('quit now');
+$decThread->join;
 pc("Thanks for using ", 'bold yellow');
 pc("nzbperl", 'bold red');
 pc("! Enjoy!\n\n", 'bold yellow');
 
+#########################################################################################
+# This is the thread that does file decoding
+# It uses two queues for communication -- decQ for files to decode, decMsgQ for status
+# messages back to the main thread.
+#########################################################################################
+sub file_decoder_thread {
+	while(1){
+		# We get 4 things on the q per file...isbroken, tmpfilename, truefilename, decodedir
+		my $isbroken= $decQ->dequeue;
+		($isbroken =~ /^quit now$/) and last;	# Time to shut down
+		my $tmpfilename = $decQ->dequeue;
+		my $truefilename = $decQ->dequeue;
+		my $decodedir = $decQ->dequeue;
+
+		if(!$isbroken or $keepbrokenbin){
+			$decMsgQ->enqueue("Starting decode of $truefilename");
+
+			# Do the decode and confirm that it worked...
+			# TODO: Make the debug file configurable and system flexible
+			my $kb = '';
+			$keepbrokenbin and $kb = '-d';	# If keeping broken, pass -d (desparate mode) to uudeview
+			my $rc = system("$uudeview -i -a $kb -q \"$tmpfilename\" -p \"$decodedir\">> $DECODE_DBG_FILE 2>&1");
+			$rc and $isbroken = 1;	# If decode failed, file is broken
+
+			if($rc){		# Problem with the decode
+				$decMsgQ->enqueue("FAILED decode of $tmpfilename (see $DECODE_DBG_FILE for details)");
+			}
+			else{
+				$decMsgQ->enqueue("Completed decode of " . $truefilename);
+			}
+		}
+
+		# Decide if we need to keep or delete the temp .parts file
+		if($keepparts or ($isbroken and $keepbroken)){
+			my $brokemsg = $isbroken ? ' broken' : '';
+			$decMsgQ->enqueue("Keeping$brokemsg file segments in $tmpfilename (--keepparts given)");
+			# TODO: rename to .broken
+		}
+		else {
+			(unlink $tmpfilename) or $decMsgQ->enqueue("Error removing $tmpfilename from disk");
+		}
+
+	}
+}
 #########################################################################################
 # Does multiplexed comms receiving
 #########################################################################################
@@ -203,6 +285,7 @@ sub doReceiverPart {
 	foreach my $i (1..$connct){
 		my $conn = $conn[$i-1];
 
+		# TODO: Create a way to disable reconnection (when we don't want to do it)
 		if(!$conn->{'sock'}){
 			doReconnectLogicPart($i-1);
 			#statMsg("DEBUG: skipping cuz sock closed");
@@ -305,18 +388,27 @@ sub doReceiverPart {
 				# Try and detect the "real" filename
 				if(not $conn->{'truefname'}){
 					my $tfn = getTrueFilename($line);
-					$tfn and ($conn->{'truefname'} = $tfn);
-					$tfn and statMsg("Conn. $i: Found true filename: $tfn");
+					if($tfn){
+						$conn->{'truefname'} = $tfn;
+						statMsg("Conn. $i: Found true filename: $tfn");
 
-					if(-e $tfn){
-						if(!$overwritefiles){
-							# We can't just close and delete, because there will likely still be 
-							# data waiting in the receive buffer.  As such, we have to set a flag
-							# to indicate that the file already exists and should be skipped...
-							# This is perhaps a bit silly -- we have to finish slurping in the
-							# BODY part before we can start working on the next file...
-							statMsg("File already exists on disk (skipping after segment completes)");
-							$conn->{'skipping'} = 1;
+						my $tfndisk = $tfn;			# Find out where it's going on disk...
+						if(defined($dlpath)){
+							$tfndisk = $dlpath . $tfn;
+						}
+						elsif(defined($dlrelative)){
+							$tfndisk = $conn->{'file'}->{'nzb path'} . $tfn;
+						}
+						if(-e $tfndisk){
+							if(!$overwritefiles){
+								# We can't just close and delete, because there will likely still be 
+								# data waiting in the receive buffer.  As such, we have to set a flag
+								# to indicate that the file already exists and should be skipped...
+								# This is perhaps a bit silly -- we have to finish slurping in the
+								# BODY part before we can start working on the next file...
+								statMsg("File already exists on disk (skipping after segment completes)");
+								$conn->{'skipping'} = 1;
+							}
 						}
 					}
 				}
@@ -431,35 +523,22 @@ sub doBodyRequests {
 			if($conn->{'segnum'} >= scalar @{$file->{'segments'}}){ # All segments for this file exhausted.
 				close $conn[$i-1]->{'tmpfile'};
 				my $tmpfilename = $conn[$i-1]->{'tmpfilename'};
-
-				if( (!$conn->{'isbroken'}) or $keepbrokenbin){
-					showDecodingStartStopMsg($i-1, 'start');
-
-					# Do the decode and confirm that it worked...
-					# TODO: Make the debug file configurable and system flexible
-					my $kb = '';
-					$keepbrokenbin and $kb = '-d';	# If keeping broken, pass -d (desparate mode) to uudeview
-					my $rc = system("uudeview -i -a $kb -q \"$tmpfilename\" >> $DECODE_DBG_FILE 2>&1");
-					$rc and $conn->{'isbroken'} = 1;	# If decode failed, file is broken
-
-					showDecodingStartStopMsg($i-1, 'stop');
-
-					if($rc){		# Problem with the decode
-						statMsg("FAILED decode of $tmpfilename (see $DECODE_DBG_FILE for details)");
-					}
-					else{
-						statMsg("Completed decode of " . $conn[$i-1]->{'truefname'});
-					}
+				my $truefilename = $conn[$i-1]->{'truefname'};
+				my $isbroken = $conn->{'isbroken'};
+				my $outdir = "./";	# default to current dir
+				if(defined($dlpath)){
+					$outdir = $dlpath;
+				}
+				elsif(defined($dlrelative)){
+					$outdir = $file->{'nzb path'};	# extract to same dir as nzb file
 				}
 
-				# Decide if we need to keep or delete the temp .parts file
-				if($keepparts or ($conn->{'isbroken'} and $keepbroken)){
-					my $brokemsg = $conn->{'isbroken'} ? ' broken' : '';
-					statMsg("Keeping$brokemsg file segments in $tmpfilename (--keepparts given)");
-				}
-				else {
-					(unlink $tmpfilename) or statMsg("Error removing $tmpfilename from disk");
-				}
+				cursorPos(5, 6+(3*($i-1)));
+				my $len = pc("File finished! Sending details to decoder queue...", 'bold white');
+				print ' ' x ($wchar-$len-6);
+				statMsg("Conn. $i: Finished downloading " . $conn[$i-1]->{'file'}->{'name'});
+				# Queue the items to the decoding thread
+				$decQ->enqueue($isbroken, $tmpfilename, $truefilename, $outdir);
 
 				drawStatusMsgs();
 
@@ -499,6 +578,12 @@ sub doFileAssignments {
 
 		# Create temp filename and open
 		my $tmpfile = 'nzbperl.tmp' . time . '.' . $i . '.parts';
+		if(defined($dlpath)){		# stick in dlpath if given
+			$tmpfile = $dlpath . $tmpfile;
+		}
+		elsif(defined($dlrelative)){ # otherwise stick in relative dir to nzbfile
+			$tmpfile = $file->{'nzb path'} . $tmpfile;
+		}
 		$conn->{'tmpfilename'} = $tmpfile;
 
 		open $conn->{'tmpfile'}, '>' . $tmpfile or 
@@ -513,10 +598,9 @@ sub doFileAssignments {
 #########################################################################################
 sub createConnections {
 
-	my $iaddr = inet_aton($server) || die "Error resolving host: $server";
-	my $paddr = sockaddr_in($port, $iaddr);
-
 	foreach my $i (1..$connct){
+		my $iaddr = inet_aton($server) || die "Error resolving host: $server";
+		my $paddr = sockaddr_in($port, $iaddr);
 		($conn[$i-1]->{'sock'}, my $line) = createSingleConnection($i-1, $paddr);
 	}
 	return 1;
@@ -532,7 +616,7 @@ sub createSingleConnection {
 	socket($sock, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die "Error creating socket: $!";
 	not $silent and printf("Attempting connection #%d to %s...", $i+1, $server);
 	connect($sock, $paddr) || die "Error connecting: $!";
-	not $silent and print "success!\n";
+	not $silent and pc("success!\n", 'bold white');
 	my $line = blockReadLine($sock);	# read server connection/response string
 	not $line =~ /^(200|201)/ and die "Unexpected server response: $line" . "Expected 200 or 201.\n";
 	return ($sock, $line);
@@ -636,15 +720,18 @@ sub getCurrentSpeed {
 #########################################################################################
 sub drawScreenAndHandleKeys {
 	if($showinghelpscreen){
-		$terminal->Tgoto('cm', 40, 13, *STDOUT);
-		print "ETA: " . getETA() . ")";
-		$terminal->Tgoto('cm', 0, (1+5+(3*$connct)+8), *STDOUT);
+		cursorPos(40, 14);
+		pc("ETA: " . getETA(), 'bold green');
+		pc(")", 'bold white');
+		cursorPos(0, (1+5+(3*$connct)+8));
 	}
-	elsif(Time::HiRes::tv_interval(\@lastdrawtime) > 0.5){	# Refresh screen every 0.5sec max
+	elsif((Time::HiRes::tv_interval(\@lastdrawtime) > 0.5) or # Refresh screen every 0.5sec max
+		($decMsgQ->pending > 0)){							  # or we got status messages from decoder thread
+
 		($wchar, $hchar, $wpixels, $hpixels) = GetTerminalSize();
 		if($oldwchar != $wchar){
 			$oldwchar and statMsg("Terminal was resized (new width = $wchar), redrawing");
-			$terminal->Tputs('cl', 1, *STDOUT);			# clears screen
+			clearScreen();
 			drawBorder();
 		}
 		$oldwchar = $wchar;
@@ -653,8 +740,8 @@ sub drawScreenAndHandleKeys {
 		drawConnInfos();
 		drawStatusMsgs();
 
-		$terminal->Tgoto('cm', 0, (1+5+(3*$connct)+8), *STDOUT);
-		print "'?' for help> ";
+		cursorPos(0, (1+5+(3*$connct)+8));
+		pc("'?' for help> ", 'bold white');
 	}
 	my $char;
 	while (defined ($char = getch()) ) {	# have a key
@@ -666,6 +753,7 @@ sub drawScreenAndHandleKeys {
 # getch -- gets a key in nonblocking mode
 #########################################################################################
 sub getch {
+	$daemon and return;
 	ReadMode ('cbreak');
 	my $char;
 	$char = ReadKey(-1);
@@ -689,6 +777,9 @@ sub doThrottling {
 		else{
 			$sleepdur *= 1.5;
 		}
+		if($sleepdur > 1.0){		# cap at 1 second sleep time, which is rediculously long anyway
+			$sleepdur = 1.0;
+		}
 	}
 	elsif($curbps < $targkBps){
 		if($sleepdur > 0){
@@ -704,39 +795,6 @@ sub doThrottling {
 		select undef, undef, undef, $sleepdur;
 	}
 }
-
-
-#########################################################################################
-# Shows a decoding starting message for a connection
-#########################################################################################
-sub showDecodingStartStopMsg {
-	my $i = shift;
-	my $st = shift;
-	my $startrow = 6;
-	my $len = 0;
-	$terminal->Tgoto('cm', 2, $startrow+(3*($i)), *STDOUT);
-	$len += pc(sprintf("%d: ", $i+1), 'bold white');
-	my $starting = "Starting decode: ";
-	my $finished = "Finished decode: ";
-
-	my $truefname = $conn[$i]->{'truefname'};
-	if($st eq 'start'){
-		my $target = $wchar - length($starting) - 7;
-		$truefname = trimString($truefname, $target);
-		$len += pc($starting, 'bold yellow');
-		$len += pc($truefname, 'bold cyan');
-	}
-	else{
-		my $target = $wchar - length($finished) - 7;
-		$truefname = trimString($truefname, $target);
-		$len += pc($finished, 'bold green');
-		$len += pc($truefname, 'bold cyan');
-	}
-	print ' ' x ($wchar-$len-4);
-	$terminal->Tgoto('cm', 2, $startrow+(3*($i))+1, *STDOUT);
-	print ' ' x ($wchar-4);
-}
-
 
 #########################################################################################
 # Trim the middle out of a string to shorten it to a target length
@@ -762,7 +820,7 @@ sub handleKey {
 
 	if($showinghelpscreen){
 		$showinghelpscreen = 0;
-		$terminal->Tputs('cl', 1, *STDOUT);			# clears screen
+		clearScreen();
 		$oldwchar = 0;		# Hack to force border(s) to be redrawn
 		return;	# cancel help screen display
 	}
@@ -842,7 +900,7 @@ sub updateBWStartPts {
 # Draws the header that contains summary info etc.
 #########################################################################################
 sub drawHeader(){
-	$terminal->Tgoto('cm', 2, 1, *STDOUT);
+	cursorPos(2, 1);
 	pc("nzbperl v.$version", 'bold red');
 	pc(" :: ", 'bold white');
 	#pc("by jason plumb ", 'bold red');
@@ -850,7 +908,7 @@ sub drawHeader(){
 	pc("noisybox.net", 'bold red');
 
 	my $len = 0;
-	$terminal->Tgoto('cm', 2, 3, *STDOUT);
+	cursorPos(2, 3);
 	$len += pc("Files remaining: ", 'bold white');
 	$len += pc($totals{'total file ct'}-$totals{'finished files'}, 'bold green');
 	$len += pc(" of ", 'white');
@@ -865,9 +923,9 @@ sub drawHeader(){
 	$len += pc($dlperc. '%', 'bold yellow');
 	$len += pc("  ETA: ", 'bold white');
 	$len += pc(getETA(), 'bold yellow');
-	print (' ' x ($wchar-$len-4));
+	pc((' ' x ($wchar-$len-4)), 'white');
 
-	$terminal->Tgoto('cm', 2, 2, *STDOUT);
+	cursorPos(2, 2);
 	$len = pc("Current speed: ", 'bold white');
 	$len += pc(getCurrentSpeed() . "Bps", 'bold green');
 	$len += pc(" (", 'bold blue');
@@ -882,7 +940,7 @@ sub drawHeader(){
 	$len += pc(")", 'bold blue');
 	$len += pc("  Session speed: ", 'bold white');
 	$len += pc(getTotalSpeed() . "Bps", 'bold green');
-	print (' ' x ($wchar-$len-4));
+	pc((' ' x ($wchar-$len-4)), 'white');
 }
 
 
@@ -895,7 +953,7 @@ sub drawConnInfos(){
 	foreach my $i(1..$connct){
 		my $conn = $conn[$i-1];
 
-		$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
+		cursorPos(2, $startrow+(3*($i-1)));
 
 		if(!$conn->{'sock'}){	# connection closed
 			$len = pc(sprintf("%d: ", $i), 'bold white');
@@ -904,22 +962,21 @@ sub drawConnInfos(){
 				my $remain = $reconndur - (time - $conn->{'sleep start'});
 				$len += pc(sprintf(" (reconnect in %s)", hrtv($remain)), 'bold yellow');
 			}
-			print (' ' x ($wchar-$len-4));
+			pc((' ' x ($wchar-$len-4)), 'white');
 
-			$terminal->Tgoto('cm', 2, $startrow+(3*($i-1))+1, *STDOUT);
-			print (' ' x ($wchar-4));
+			cursorPos(2, $startrow+(3*($i-1))+1);
+			pc((' ' x ($wchar-4)), 'white');
 			next;
 		}
 
 		if(not $conn->{'file'}){
 			if(scalar(@queuefileset) == 0){
 				# This connection has no more work to do...
-				#$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
 				$len = pc(sprintf("%d: Nothing left to do...", $i), 'bold cyan');
-				print (' ' x ($wchar-$len-4));
-				$terminal->Tgoto('cm', 2, $startrow+(3*($i-1))+1, *STDOUT);
+				pc((' ' x ($wchar-$len-4)), 'white');
+				cursorPos(2, $startrow+(3*($i-1))+1);
 				$len = pc("   <waiting for others to finish>", 'bold cyan');
-				print (' ' x ($wchar-$len-4));
+				pc((' ' x ($wchar-$len-4)), 'white');
 			}
 			next;
 		}
@@ -932,17 +989,17 @@ sub drawConnInfos(){
 		my $segbytesread = $conn->{'segbytes'};
 		my $cursegsize = @{$conn->{'file'}->{'segments'}}[$segnum-1]->{'size'};
 
-		#$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
-
 		$len = pc(sprintf("%d: Downloading: ", $i), 'bold white');
 		my $fn = $file->{'name'};
 		if( length($fn) + $len > $wchar-4){
 			$fn = substr($fn, 0, $wchar-4-$len);
 		}
-		
-		pc($fn, 'white');
+		$len += pc($fn, 'white');
+		if($len < $wchar-4){
+			pc(' ' x ($wchar-$len-4), 'white');
+		}
 
-		$terminal->Tgoto('cm', 2, $startrow+(3*($i-1))+1, *STDOUT);
+		cursorPos(2, $startrow+(3*($i-1))+1);
 		my $perc = 0;
 		$filesize and $perc = int(($filebytesread/$filesize)*25);
 		$len = pc("   |", 'bold white');
@@ -974,7 +1031,7 @@ sub drawConnInfos(){
 		$len += pc(hrsv($cursegsize), 'bold cyan');
 		$len += pc("]", 'bold white');
 
-		print ' ' x ($wchar - $len - 4);
+		pc((' ' x ($wchar - $len - 4)), 'white');
 
 	}
 
@@ -988,12 +1045,18 @@ sub drawStatusMsgs {
 	my $row = 3*$connct + 6 + 1;
 	my $statuslimit = 6;	# number of lines to show.
 
+	# Pull any decode messages from the queue and append them
+	# This might not be the *best* place for this...
+	while($decMsgQ->pending > 0){
+		statMsg($decMsgQ->dequeue);
+	}
+
 	# Trim status messages to size
 	while( scalar(@statusmsgs) > $statuslimit){
 		shift @statusmsgs;
 	}
 	foreach my $line (@statusmsgs){
-		$terminal->Tgoto('cm', 2, $row, *STDOUT);
+		cursorPos(2, $row);
 		if(length($line) > $wchar-4){
 			$line = substr($line, 0, $wchar-4);	# Clip line
 		}
@@ -1003,8 +1066,8 @@ sub drawStatusMsgs {
 		pc($line, 'white');
 		$row++;
 	}
-	$terminal->Tgoto('cm', 0, (1+5+(3*$connct)+8), *STDOUT);
-	print "'?' for help> ";
+	cursorPos(0, (1+5+(3*$connct)+8));
+	pc("'?' for help> ", 'bold white');
 }
 
 #########################################################################################
@@ -1021,7 +1084,7 @@ sub drawBorder {
 
 sub drawHLine {
 	my $ypos = shift;
-	$terminal->Tgoto('cm', 0, $ypos, *STDOUT);
+	cursorPos(0, $ypos);
 	pc('+' . ('-' x ($wchar-2)) . '+', 'bold white');
 }
 sub drawVLine {
@@ -1029,7 +1092,7 @@ sub drawVLine {
 	my $height = shift;
 	not $height and $height = (1+5+(3*$connct)+7);
 	foreach(0..$height){
-		$terminal->Tgoto('cm', $xpos, $_, *STDOUT);
+		cursorPos($xpos, $_);
 		pc('|', 'bold white');
 	}
 }
@@ -1039,6 +1102,7 @@ sub drawVLine {
 #########################################################################################
 sub pc {
 	my ($string, $colstr) = @_;
+	$daemon and return length($string);
 	if($usecolor){
 		print colored ($string, $colstr);
 	}
@@ -1048,6 +1112,19 @@ sub pc {
 	return length($string);
 }
 
+sub clearScreen {
+	!$daemon and 
+		$terminal->Tputs('cl', 1, *STDOUT);			# clears screen
+}
+
+#########################################################################################
+# Positions the cursor at x,y.  Looks at $daemon first.
+#########################################################################################
+sub cursorPos {
+	my ($x, $y) = @_;
+	!$daemon and 
+		$terminal->Tgoto('cm', $x, $y, *STDOUT);
+}
 #########################################################################################
 # Adds a status message with timestamp
 #########################################################################################
@@ -1168,7 +1245,8 @@ sub computeTotalNZBSize {
 #########################################################################################
 sub parseNZB {
 
-	my ($nzbfilename, $sorted) = @_;
+	my $nzbfilename = shift;
+	my $nzbdir = derivePath($nzbfilename);
 	my $parser = new XML::DOM::Parser;
 	my @fileset;
 	print "Loading and parsing nzb file: " . $nzbfilename . "\n";
@@ -1181,6 +1259,7 @@ sub parseNZB {
 		my $postdate = $fileNode->getAttributes()->getNamedItem('date');
 
 		my %file;
+		$file{'nzb path'} = $nzbdir;
 		$file{'name'} = $subj->getValue();
 		$file{'date'} = $postdate->getValue();
 
@@ -1212,17 +1291,14 @@ sub parseNZB {
 	}
 	$nzbdoc->dispose;
 
-	if($sorted){
-		print "Sorting files by filename (subject)...";
-		@fileset = 
-			sort {
-				$a->{'name'} cmp $b->{'name'};
-			} @fileset;
-		print "finished.\n";
-			
-	}
 	print "Loaded $totalsegct total segments for " . $files->getLength() . " file(s).\n";
+	return @fileset;
+}
 
+#########################################################################################
+# Filters out files if there is a filter regex, and skips over files from --skip <n>
+#########################################################################################
+sub regexAndSkipping {
 	if(defined($filterregex)){
 		print "Filtering files on regular expression...\n";
 		my $orgsize = scalar @fileset;
@@ -1255,6 +1331,32 @@ sub parseNZB {
 	return @fileset;
 }
 
+#########################################################################################
+# Sorts files in the fileset based on the name
+#########################################################################################
+sub sortFilesBySubject {
+	if(!$nosort){
+		print "Sorting files by filename (subject)...";
+		@fileset = 
+			sort {
+				$a->{'name'} cmp $b->{'name'};
+			} @fileset;
+		print "finished.\n";
+			
+	}
+}
+#########################################################################################
+# Derives a path from a filename (passed on commandline).
+# The result isn't necessarily absolute, can be relative
+#########################################################################################
+sub derivePath {
+	my $filename = shift;
+	if($filename =~ /\//){		# then it has path information, likely not windows compat
+		$filename =~ s/(^.*\/).*/\1/;
+		return $filename;
+	}
+	return './';
+}
 #########################################################################################
 # Main entry point for NZB file sanity checking
 #########################################################################################
@@ -1321,7 +1423,8 @@ sub showSuspectDetails {
 		my @sids = getSuspectSegmentIndexes($file, $avgsize);
 		foreach my $si (@sids){
 			my $seg = @{$file->{'segments'}}[$si];
-			my $percdiff = 100*(abs($seg->{'size'} - $avgsize)/$avgsize);
+			my $percdiff = 100;
+			$avgsize and $percdiff = 100*(abs($seg->{'size'} - $avgsize)/$avgsize);
 			printf("      Part %d : %d bytes (%.2f%% error from average)\n",
 					$si+1, $seg->{'size'}, $percdiff);
 		}
@@ -1353,9 +1456,12 @@ sub getSuspectSegmentIndexes {
 	my $MAX_OFF_PERC = 25;		# Percentage of segment size error/diff to trigger invalid
 	my ($file, $avg) = @_;
 	my @ret;
+	#print "DEBUG: File subject = " . $file->{'name'} . "\n";
+	#print "DEBUG: It has " . (scalar @{$file->{'segments'}}) . " parts\n";
 	foreach my $i (1..(scalar @{$file->{'segments'}}-1)){  # Last segment is allowed to slide...
 		my $seg = @{$file->{'segments'}}[$i-1];
-		my $percdiff = 100*(abs($seg->{'size'} - $avg)/$avg);
+		my $percdiff = 100;
+		$avg and $percdiff = 100*(abs($seg->{'size'} - $avg)/$avg);
 		#printf("   seg $i of %d is %0.2f off avg [%d versus %d (avg)]\n", scalar @{$file->{'segments'}}, $percdiff, $seg->{'size'}, $avg);
 		if($percdiff > $MAX_OFF_PERC){
 			push @ret, $i-1;
@@ -1439,12 +1545,43 @@ sub handleCommandLineOptions {
 		$port =~ s/.*://;
 		$server =~ s/:.*//;
 	}
+	# Make sure that dlpath ends with a slash
+	$dlpath and (not ($dlpath =~ /\/$/)) and ($dlpath .= '/');
 
 	if($dropbad and $insane){	# conflicting
 		print "Error: --dropbad and --insane are conflicting (choose one)\n";
 		showUsage();
 		exit;
 	}
+	if($dlpath and $dlrelative){ # conflicting options
+		print "Error: --dlrelative and --dlpath <dir> are conflicting (choose one)\n";
+		showUsage();
+		exit;
+	}
+}
+
+# Helper to detect that uudeview is installed.  Always a good idea, ya'know, since we're
+# dependant on it!
+sub haveUUDeview {
+	if(defined($uudeview)){	# Given on commandline or config file
+		if(-e $uudeview){
+			pc("uudeview found: $uudeview\n", "bold green");
+			return 1;
+		}
+		pc("Warning: uudeview not found at location $uudeview\n", "bold yellow");
+	}
+	my @paths = split /:/, $ENV{'PATH'};	# path sep different on winderz?
+	foreach my $p (@paths){
+		$p =~ s/\/$//;
+		$p = $p . "/uudeview";
+		if(-e $p){
+			pc("uudeview found: $p\n", "bold green");
+			$uudeview = $p;
+			return 1;
+		}
+	}
+	pc("Error: uudeview not found in path...aborting!\n", "bold red");
+	return 0;
 }
 
 sub readConfigFileOptions(){
@@ -1466,6 +1603,36 @@ sub readConfigFileOptions(){
 	GetOptions(%optionsmap);
 	@ARGV = @oldarg;
 }
+#########################################################################################
+# Checks for a newer version, disabled with --noupdate
+#########################################################################################
+sub checkForNewVersion {
+	$noupdate and return;	# they don't want update checking
+	print "Checking for availability of newer version...\n";
+	eval "use LWP::Simple;";
+	if($@){
+		print "LWP::Simple is not installed, skipping up-to-date check.\n";
+		return;
+	}
+	my $remote_ver = eval "get \"$UPDATE_URL\"";
+	chomp $remote_ver;
+
+	if($remote_ver eq $version){
+		print "Look like you're running the most current version.  Good.\n";
+	}
+	else{
+		pc("A newer version of nzbperl is available: ", 'bold red');
+		pc('version ' . $remote_ver . "\n", 'bold white');
+		pc("You should consider downloading it from ", 'bold white');
+		pc("http://noisybox.net/computers/nzbperl/\n", 'bold yellow');
+		pc("This delay is intentional: ");
+		foreach(1..8){
+			print "..." . (9-$_);
+			sleep 1;
+		}
+	}
+
+}
 
 #########################################################################################
 sub displayShortGPL {
@@ -1484,7 +1651,7 @@ EOL
 # Shows a help screen for interactive keys
 #########################################################################################
 sub showHelpScreen {
-	$terminal->Tputs('cl', 1, *STDOUT);			# clears screen
+	clearScreen();
 	print <<EOL
 
   Hi.  This is the nzbperl help screen. 
@@ -1499,6 +1666,7 @@ sub showHelpScreen {
   'q'   : Quit the program (aborts all downloads)
   '?'   : Show this help screen
 
+  Connected to $server:$port
   (Your download is still in progress:  
   
   [ Press any key to return to the main screen ]
@@ -1510,8 +1678,9 @@ EOL
 	drawHLine(0);
 	drawHLine(17);
 
-	$terminal->Tgoto('cm', 40, 13, *STDOUT);
-	print "ETA: " . getETA() . ")";
+	cursorPos(40, 14);
+	pc("ETA: " . getETA(), 'bold green');
+	pc(")", 'bold white');
 	$showinghelpscreen = 1;
 }
 
@@ -1523,7 +1692,7 @@ print <<EOL
 
   nzbperl version $version -- usage:
 
-  nzbperl <options> <filename.nzb>
+  nzbperl <options> <file1.nzb> ... <file.nzb>
 
   where <options> are:
 
@@ -1537,6 +1706,10 @@ print <<EOL
   --keepbroken      : Continue downloading files with broken/missing segments
                     : and leave the parts files on disk still encoded.
   --keepbrokenbin   : Decode and keep broken decoded files (binaries) on disk.
+  --dlrelative      : Download and decode to the dir that the nzbfiles are in
+                    : (default downloads to current directory)
+  --dlpath <dir>    : Download and decode all files to <dir>  
+                    : (default downloads to current dirctory)
   --redo            : Don't skip over existing downloads, do them again
   --insane          : Bypass NZB sanity checks completely
   --dropbad         : Auto-skip files in the NZBs with suspected broken parts
@@ -1545,10 +1718,13 @@ print <<EOL
   --low <kBps>      : Set "low" bandwidth to kBps (default is 35kBps)
   --speed <speed>   : Explicitly specify transfer bandwidth in kBps
   --log <file>      : Log status messages into <file> (default = none)
+  --daemon          : Run in background as daemon (use log for status)
   --retrywait <n>   : Wait <n> seconds between reconnect tries (default = 300)
   --nosort          : Don't sort files by name before processing
   --filter <regex>  : Filter NZB contents on <regex> in subject line
+  --uudeview <app>  : Specify full path to uudeview (default found in \$PATH)
   --nocolor         : Don't use color
+  --noupdate        : Don't check for newer versions at startup
   --help            : Show this screen
 
   During runtime, press 'h' or '?' to see a list of key commands.
