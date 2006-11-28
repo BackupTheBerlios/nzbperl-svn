@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# nzbperl.pl -- version 0.6.3
+# nzbperl.pl -- version 0.6.4
 # 
 # for more information:
 # http://noisybox.net/computers/nzbperl/ 
@@ -32,14 +32,17 @@
 use strict;
 use threads;
 use Thread::Queue;
-use Socket;
+use File::Basename;
+use IO::File;
+use IO::Socket::INET;
+use IO::Select;
 use XML::DOM;
 use Getopt::Long;
 use Time::HiRes;	# timer stuff
 use Term::ReadKey;	# for no echo password reading
 use Term::Cap;
 
-my $version = '0.6.3';
+my $version = '0.6.4';
 my $ospeed;
 my $terminal = Tgetent Term::Cap { TERM => undef, OSPEED => $ospeed };
 my $recv_chunksize = 5*1024;	# How big of chunks we read at once from a connection (this is pulled from ass)
@@ -61,12 +64,22 @@ my $showinghelpscreen = 0;
 my $skipthisfile = 0;
 my $usecolor = 1;
 my $logfile;
-my ($server, $port, $user, $pw, $keepparts, $keepbroken, $keepbrokenbin, $help, $nosort, 
-    $overwritefiles, $connct, $nocolor, $insane, 
-	$dropbad, $skipfilect, $reconndur, $filterregex, 
-	$configfile, $uudeview, $daemon, $dlrelative, $dlpath, $noupdate) =
-	('', 119, '', '', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 300, undef, "$ENV{HOME}/.nzbperlrc", undef, 
-	0, undef, undef, 0);
+
+# These are getting hefty, so they're now 5 per line
+my (	$server, $port, $user, $pw, $keepparts, 
+		$keepbroken, $keepbrokenbin, $help, $nosort, $overwritefiles, 
+		$connct, $nocolor, $insane, $dropbad, $skipfilect, 
+		$reconndur, $filterregex, $configfile, $uudeview, $daemon, 
+		$dlrelative, $dlpath, $noupdate, $ssl, $socks_server, 
+		$socks_port, $proxy_user, $proxy_passwd, $http_proxy_server, $http_proxy_port, 
+		$dlcreate, $noansi, $queuedir) =
+	(	'', -1, '', '', 0, 
+		0, 0, 0, 0, 0, 
+		2, 0, 0, 0, 0, 
+		300, undef, "$ENV{HOME}/.nzbperlrc", undef, 0, 
+		undef, undef, 0, undef, undef, 
+		-1, undef, undef, undef, -1, 
+		undef, 0, undef);
 
 # How commandline args are mapped to vars.  This map is also used by config file processor
 my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw, 
@@ -79,9 +92,17 @@ my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw,
 				'skip=i' => \$skipfilect, 'retrywait=i' => \$reconndur,
 				'filter=s' => \$filterregex, 'config=s' => \$configfile,
 				'uudeview=s' => \$uudeview, 'daemon' => \$daemon,
-				'dlrelative' => \$dlrelative, 'dlpath=s' => \$dlpath, 'noupdate' => \$noupdate);
+				'dlrelative' => \$dlrelative, 'dlpath=s' => \$dlpath, 'noupdate' => \$noupdate,
+				'ssl' => \$ssl, 'socks_server=s' => \$socks_server, 'socks_port=i' => \$socks_port,
+				'socks_user=s' => \$proxy_user, 'socks_passwd=s' => \$proxy_passwd,
+				'http_proxy=s' => \$http_proxy_server, 'dlcreate'=>\$dlcreate, 'noansi'=>\$noansi,
+				'queuedir=s' => \$queuedir);
 
-handleCommandLineOptions();
+if(!handleCommandLineOptions()){
+	showUsage(); 
+	exit 1;
+}
+
 if(not $nocolor){
 	use Term::ANSIColor;
 }
@@ -91,12 +112,23 @@ if(not haveUUDeview()){	# Verify that uudeview is installed
 }
 
 displayShortGPL();
+
 checkForNewVersion();
 
 if($user and !$pw){
 	print "Password for '$user': ";
 	$pw = readPassword();
 }
+if(defined($proxy_user) and not defined($proxy_passwd)){
+	print "SOCKS Password for '$proxy_user': ";
+	$proxy_passwd = readPassword();
+}
+
+
+my $lastdirchecktime = 0;
+my %nzbfiles;	# the hash/queue of nzb files we're handling
+# $nzbfiles{<filename>}->{'read'}     : 1 if we've parsed/loaded it
+# $nzbfiles{<filename>}->{'finished'} : 1 if all files have been downloaded
 
 my @fileset;
 while(scalar(@ARGV) > 0){
@@ -142,6 +174,7 @@ statMsg('Welcome -- nzbperl started!');
 # $conn->{'last data'}  : time when data was last seen on this channel
 # $conn->{'sleep start'}: time that we started sleeping (for retries)
 # $conn->{'isbroken'}   : set when one or more parts fails to download
+# $conn->{'tfseq'}      : temporary file sequence id
 
 $totals{'total file ct'} = scalar @fileset;
 
@@ -182,17 +215,25 @@ while(1){
 
 	doReceiverPart();
 
+	queueNewNZBFilesFromDir();	# queue up new nzb files from dir (guards inside)
+
 	# See if queuefileset is empty AND all sockets don't have files
 	# when that happens, that's when we're done.
-	if(not scalar @queuefileset){
+	if(not scalar @queuefileset){		# no more files in queue
 		doBodyRequests();		# total hack, but that's where decoding happens...
+	}
+
+	dequeueNextNZBFileIfNecessary();
+
+	if(not scalar @queuefileset){		# no more files in queue
 		my $done = 1;
 		foreach my $i (1..$connct){
 			if($conn[$i-1]->{'file'}){
-				$done = 0;
+				$done = 0;	# not done, at least 1 connection still going
 				last;
 			}
 		}
+
 		if($done){
 			cursorPos(0, 1+5+(3*$connct)+9);
 			pc("All downloads complete!\n", 'bold white');
@@ -228,14 +269,18 @@ pc("! Enjoy!\n\n", 'bold yellow');
 # messages back to the main thread.
 #########################################################################################
 sub file_decoder_thread {
+	my ($isbroken, $tmpfilename, $truefilename, $decodedir);
+
 	while(1){
 		# We get 4 things on the q per file...isbroken, tmpfilename, truefilename, decodedir
-		my $isbroken= $decQ->dequeue;
+		$isbroken= $decQ->dequeue;
+		last unless defined($isbroken);
 		($isbroken =~ /^quit now$/) and last;	# Time to shut down
-		my $tmpfilename = $decQ->dequeue;
-		my $truefilename = $decQ->dequeue;
-		my $decodedir = $decQ->dequeue;
 
+		$tmpfilename = $decQ->dequeue;
+		$truefilename = $decQ->dequeue;
+		$decodedir = $decQ->dequeue;
+		
 		if(!$isbroken or $keepbrokenbin){
 			$decMsgQ->enqueue("Starting decode of $truefilename");
 
@@ -261,46 +306,69 @@ sub file_decoder_thread {
 			# TODO: rename to .broken
 		}
 		else {
-			(unlink $tmpfilename) or $decMsgQ->enqueue("Error removing $tmpfilename from disk");
+			unlink($tmpfilename) or $decMsgQ->enqueue("Error removing $tmpfilename from disk: $!");
 		}
-
 	}
 }
 #########################################################################################
 # Does multiplexed comms receiving
 #########################################################################################
 sub doReceiverPart {
-	my ($rin, $ein) = ('', '');
-	my ($rout, $eout);
+	my $select = IO::Select->new();
 
 	foreach my $i (1..$connct){
-		next unless ($conn[$i-1]->{'sock'});
-		vec($rin, fileno($conn[$i-1]->{'sock'}), 1) = 1;
-		vec($ein, fileno($conn[$i-1]->{'sock'}), 1) = 1;
+	    next unless (defined($conn[$i-1]->{'sock'}));
+	    $select->add($conn[$i-1]->{'sock'});
 	}
 
-	my $nfound = select($rout=$rin, undef, $eout=$ein, 0.25);  
-	#statMsg("DEBUG: after select (nfound = $nfound)");
+	my @ready = $select->can_read(0.25);
 
 	foreach my $i (1..$connct){
 		my $conn = $conn[$i-1];
 
 		# TODO: Create a way to disable reconnection (when we don't want to do it)
-		if(!$conn->{'sock'}){
+		#if((!defined($conn->{'sock'})) or (!$conn->{'sock'}->connected)){
+		if(!defined($conn->{'sock'})){
 			doReconnectLogicPart($i-1);
-			#statMsg("DEBUG: skipping cuz sock closed");
+			# statMsg("DEBUG: skipping cuz sock closed");
 			next;
 		}
 		
-		if(vec($rout, fileno($conn->{'sock'}),1) == 1){
-			my $recvret = recv $conn->{'sock'}, my $buff, $recv_chunksize, undef;
+		my $canread = 0;
+		foreach my $fh (@ready) {
+		    if ($fh == $conn->{'sock'}) {
+				# statMsg(sprintf("DEBUG: Can read from connection %d", $i));
+				$canread = 1;
+				last;
+		    }
+		}
 
-			#statMsg(sprintf("DEBUG: bstatus = %s", $conn->{'bstatus'}));
-			#statMsg("DEBUG: buff just got: $buff");
+		if ($canread) {
+			my ($recvret, $buff);
+			if (ref($conn->{'sock'}) eq "IO::Socket::SSL") {
+			    $recvret = $conn->{'sock'}->sysread($buff, $recv_chunksize);
+			} 
+			else {
+			    $recvret = recv($conn->{'sock'}, $buff, $recv_chunksize, 0);
+				if(defined($recvret)){
+					$recvret = length $buff;
+				}
+				else{
+					$recvret = -1;
+				}
+			}
+			#statMsg(sprintf("DEBUG: bstatus = %s [%d]", $conn->{'bstatus'}, length($buff)));
+			#statMsg("DEBUG: buff just got:\n$buff");
 
-			if(!defined($recvret) or !length($buff)){
+			if(($recvret < 0) or !length($buff)){
 				# TODO: Determine how to gracefully handle the crap we've already downloaded 
-				close($conn->{'sock'});
+				if (ref($conn->{'sock'}) eq "IO::Socket::SSL") {
+					$conn->{'sock'}->shutdown( 2 );
+					$conn->{'sock'}->close( SSL_no_shutdown => 1 );
+				} 
+				else {
+					$conn->{'sock'}->close;
+				}
 				$conn->{'sock'} = undef;
 				$conn->{'sleep start'} = time;
 				statMsg(sprintf("* Remote disconnect on connection #%d", $i));
@@ -325,10 +393,10 @@ sub doReceiverPart {
 
 				if($conn->{'bstatus'} =~ /starting/){
 
-					#statMsg(sprintf("DEBUG: buffer has %d lines", scalar split /\r\n/s, $conn->{'buff'}));
+					# statMsg(sprintf("DEBUG: buffer has %d lines", scalar split /\r\n/s, $conn->{'buff'}));
 					
 					my ($mcode, $msize, $mbody, $mid) = split /\s+/, $line;
-					#statMsg("DEBUG: msize for this line is $msize");
+					# statMsg("DEBUG: msize for this line is $msize");
 
 					# We're just starting, need to slurp up 222 (or other) response
 					if($line =~ /^2\d\d\s.*\r\n/s){
@@ -393,8 +461,15 @@ sub doReceiverPart {
 						statMsg("Conn. $i: Found true filename: $tfn");
 
 						my $tfndisk = $tfn;			# Find out where it's going on disk...
+
 						if(defined($dlpath)){
-							$tfndisk = $dlpath . $tfn;
+						    if (defined($dlcreate)) {	# if we like to create nicely organized subdirs
+								mkdir $dlpath . $conn->{'file'}->{'nzb path'} unless (-d $dlpath . $conn->{'file'}->{'nzb path'});
+								$tfndisk = $dlpath . $conn->{'file'}->{'nzb path'} . "$tfn";
+						    } 
+							else {
+								$tfndisk = $dlpath . $tfn;
+						    }
 						}
 						elsif(defined($dlrelative)){
 							$tfndisk = $conn->{'file'}->{'nzb path'} . $tfn;
@@ -406,7 +481,7 @@ sub doReceiverPart {
 								# to indicate that the file already exists and should be skipped...
 								# This is perhaps a bit silly -- we have to finish slurping in the
 								# BODY part before we can start working on the next file...
-								statMsg("File already exists on disk (skipping after segment completes)");
+								statMsg("Conn $i: File already exists on disk (skipping after segment completes)");
 								$conn->{'skipping'} = 1;
 							}
 						}
@@ -430,7 +505,7 @@ sub doReceiverPart {
 				}
 				else{
 					$line =~ s/^\.\././o;
-					#statMsg("DEBUG: line is $line");
+					# statMsg("DEBUG: line is $line");
 					print {$conn->{'tmpfile'}} $line;
 				}
 			}
@@ -439,7 +514,7 @@ sub doReceiverPart {
 		doThrottling();
 	}
 
-	if($nfound == 0){	# No active connections, need to repaint anyway
+	if ($#ready < 0) {
 		drawScreenAndHandleKeys();
 		doThrottling();
 	}
@@ -458,10 +533,17 @@ sub doReconnectLogicPart {
 		return;
 	}
 	my $iaddr = inet_aton($server) || die "Error resolving host: $server";
-	my $paddr = sockaddr_in($port, $iaddr);
+	#my $paddr = sockaddr_in($port, $iaddr);
 
 	statMsg(sprintf("Connection #%d attempting reconnect to %s:%d...", $i+1, $server, $port));
-	($conn->{'sock'}, my $line) = createSingleConnection($i, $paddr, 1);
+	#($conn->{'sock'}, my $line) = createSingleConnection($i, $paddr, 1);
+	($conn->{'sock'}, my $line) = createSingleConnection($i, "$server:$port", 1);
+
+	if(!$conn->{'sock'}){		# couldn't reconnect
+		statMsg($line);
+		$conn->{'sleep start'} = time;	# reset reconnect timer
+		return;
+	}
 
 	my $msg = sprintf("Connection #%d reestablished.", $i+1);
 	$user and $msg .= "..performing login";
@@ -514,20 +596,28 @@ sub doBodyRequests {
 			my $seg = @{$file->{'segments'}}[0];
 			$conn->{'seg'} = $seg;
 			my $msgid = $seg->{'msgid'};
-			send $conn->{'sock'}, 'BODY <' . $msgid . ">\r\n", undef;
+
+			sockSend($conn->{'sock'}, 'BODY <' . $msgid . ">\r\n");
+
 			$conn->{'bstatus'} = 'starting';
 		}
 		elsif($conn->{'bstatus'} =~ /finished/){ # finished a segment
 			$conn->{'segnum'}++;
 
 			if($conn->{'segnum'} >= scalar @{$file->{'segments'}}){ # All segments for this file exhausted.
-				close $conn[$i-1]->{'tmpfile'};
-				my $tmpfilename = $conn[$i-1]->{'tmpfilename'};
-				my $truefilename = $conn[$i-1]->{'truefname'};
+				close $conn->{'tmpfile'};
+				my $tmpfilename = $conn->{'tmpfilename'};
+				my $truefilename = $conn->{'truefname'};
 				my $isbroken = $conn->{'isbroken'};
+				$isbroken = 0 unless (defined($isbroken)); # ensure a definite value
 				my $outdir = "./";	# default to current dir
 				if(defined($dlpath)){
-					$outdir = $dlpath;
+				    if (defined($dlcreate)) {
+						$outdir = $dlpath . $file->{'nzb path'};
+				    } 
+					else {
+						$outdir = $dlpath;
+				    }
 				}
 				elsif(defined($dlrelative)){
 					$outdir = $file->{'nzb path'};	# extract to same dir as nzb file
@@ -536,8 +626,9 @@ sub doBodyRequests {
 				cursorPos(5, 6+(3*($i-1)));
 				my $len = pc("File finished! Sending details to decoder queue...", 'bold white');
 				print ' ' x ($wchar-$len-6);
-				statMsg("Conn. $i: Finished downloading " . $conn[$i-1]->{'file'}->{'name'});
+				statMsg("Conn. $i: Finished downloading " . $conn->{'file'}->{'name'});
 				# Queue the items to the decoding thread
+				# statMsg("DEBUG: Conn. $i: Queueing (\"$isbroken\", \"$tmpfilename\", \"$truefilename\", \"$outdir\")");
 				$decQ->enqueue($isbroken, $tmpfilename, $truefilename, $outdir);
 
 				drawStatusMsgs();
@@ -552,7 +643,9 @@ sub doBodyRequests {
 				my $seg = @{$file->{'segments'}}[$segnum];
 				$conn->{'seg'} = $seg;
 				my $msgid = $seg->{'msgid'};
-				send $conn->{'sock'}, 'BODY <' . $msgid . ">\r\n", undef;
+
+				sockSend($conn->{'sock'}, 'BODY <' . $msgid . ">\r\n");
+
 				$conn->{'bstatus'} = 'starting';
 			}
 		}
@@ -566,6 +659,7 @@ sub doFileAssignments {
 	foreach my $i (1..$connct){
 		my $conn = $conn[$i-1];
 		next if $conn->{'file'};	# already working on a file
+
 		my $file = shift @queuefileset;
 		last unless $file;
 		statMsg(sprintf("Conn. %d starting file: %s", $i, $file->{'name'}));
@@ -574,10 +668,12 @@ sub doFileAssignments {
 		$conn->{'filebytes'} = 0;
 		$conn->{'truefname'} = undef;
 		$conn->{'bwstartbytes'} = 0;
+		$conn->{'isbroken'} = 0; # Assume unbroken until we know it is
 		@{$conn->{'bwstarttime'}} = Time::HiRes::gettimeofday();
+		$conn->{'tfseq'}++;
 
 		# Create temp filename and open
-		my $tmpfile = 'nzbperl.tmp' . time . '.' . $i . '.parts';
+		my $tmpfile = 'nzbperl.tmp' . time . '.' . $i . '.' . $conn->{'tfseq'} . '.parts';
 		if(defined($dlpath)){		# stick in dlpath if given
 			$tmpfile = $dlpath . $tmpfile;
 		}
@@ -594,13 +690,87 @@ sub doFileAssignments {
 }
 
 #########################################################################################
+# Decides if its time to do the next nzb file...which is when the @queuefileset array
+# is empty and there is at least 1 idle connection.
+#########################################################################################
+sub dequeueNextNZBFileIfNecessary {
+	
+	return if scalar(@queuefileset);	# still have queued files
+
+	my $done = 1;
+	foreach my $i (1..$connct){
+		if(not $conn[$i-1]->{'file'}){	# the connection is idle
+			queueNewNZBFilesFromDir(1);			# force a dircheck first
+			dequeueNextNZBFile();
+			return;
+		}
+	}
+}
+
+#########################################################################################
+# Pulls out the next nzb file in queue, parses it, and then add its files/parts to 
+# @queuefileset.
+#########################################################################################
+sub dequeueNextNZBFile {
+	my @keys = keys %nzbfiles;
+	foreach my $key (@keys){
+		if(not $nzbfiles{$key}->{'read'}){
+			statMsg("Moving to next nzb file in queue: $key");
+			my @newset = parseNZB($queuedir . '/' . $key);
+			push @queuefileset, @newset;
+			statMsg("Loaded " . scalar(@newset) . " new files to download from nzb file: $key");
+			$totals{'total file ct'} += scalar @newset;
+			$totals{'total size'} += computeTotalNZBSize(@newset);
+			$nzbfiles{$key}->{'read'} = 1;
+			last;
+		}
+	}
+
+}
+#########################################################################################
+# Looks at the nzbfile hash and counts the number that haven't been read (are queued) 
+#########################################################################################
+sub countQueuedNZBFiles {
+	my @keys = keys %nzbfiles;
+	my $ct = 0;
+	foreach my $key (@keys){
+		if($nzbfiles{$key}->{'read'} == 0){
+			$ct++;
+		}
+	}
+	return $ct;
+}
+
+#########################################################################################
+# queues new nzb files from the queue dir if they exist and adds them to the hash/queue
+# of all nzb files we're processing.
+#########################################################################################
+sub queueNewNZBFilesFromDir {
+	my $forcecheck = shift;
+	return unless $queuedir and not scalar @queuefileset;
+	return unless $forcecheck or (time - $lastdirchecktime > 15);	# don't check more than once every 15 seconds
+	$lastdirchecktime = time;
+
+	opendir(QDIR, $queuedir);
+	my @candidates = grep(/\.nzb$/, readdir(QDIR));
+	foreach my $file (@candidates){
+		if( !defined($nzbfiles{$file})){	# not queued yet
+			statMsg("Queueing new nzb file found on disk: $file");
+			$nzbfiles{$file}->{'read'} = 0;
+		}
+	}
+	closedir(QDIR);
+
+}
+#########################################################################################
 # Creates all connections and adds them to the @conn global
 #########################################################################################
 sub createConnections {
 
 	foreach my $i (1..$connct){
 		my $iaddr = inet_aton($server) || die "Error resolving host: $server";
-		my $paddr = sockaddr_in($port, $iaddr);
+		#my $paddr = sockaddr_in($port, $iaddr);
+		my $paddr = "$server:$port";
 		($conn[$i-1]->{'sock'}, my $line) = createSingleConnection($i-1, $paddr);
 	}
 	return 1;
@@ -612,13 +782,58 @@ sub createConnections {
 #########################################################################################
 sub createSingleConnection {
 	my ($i, $paddr, $silent) = @_;
-	my $sock;
-	socket($sock, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die "Error creating socket: $!";
-	not $silent and printf("Attempting connection #%d to %s...", $i+1, $server);
-	connect($sock, $paddr) || die "Error connecting: $!";
+	my ($osock, $sock) = (undef, undef);
+
+	if (defined($socks_server)) {
+	    not $silent and printf("Attempting SOCKS connection #%d %s:%d ->%s:%d...",
+				   $i+1, $socks_server, $socks_port, $server, $port);
+
+		my %sockparam = (ProxyAddr => $socks_server, ProxyPort => $socks_port,
+			ConnectAddr => $server, ConnectPort => $port );
+
+		if(defined($proxy_user)){		# Add authentication info
+			$sockparam{'AuthType'} = 'userpass';
+			$sockparam{'Username'} = $proxy_user;
+			$sockparam{'Password'} = $proxy_passwd;
+		}
+
+	    $osock = IO::Socket::Socks->new( %sockparam );
+	} 
+	elsif (defined($http_proxy_server)) {
+	    not $silent and printf('Attempting HTTP Proxy connection #%d %s:%d -> %s:%d...',
+				   $i+1, $http_proxy_server, $http_proxy_port, $server, $port);
+	    $osock = Net::HTTPTunnel->new( 'proxy-host' => $http_proxy_server,
+					   'proxy-port' => $http_proxy_port,
+					   'remote-host' => $server,
+					   'remote-port' => $port );
+	} 
+	else {
+		#porl(sprintf('Attempting connection #%d to %s:%d...', $i+1, $server, $port));
+	    not $silent and printf('Attempting connection #%d to %s:%d...', $i+1, $server, $port);
+	    $osock = IO::Socket::INET->new( PeerAddr=>$paddr, Proto=>'tcp', TYPE=>SOCK_STREAM);
+	}
+	if(!$osock){
+		return (undef, "Error connecting to server: '$!'");
+	}
 	not $silent and pc("success!\n", 'bold white');
+
+	if (defined($ssl)) {
+	    not $silent and printf("Establishing SSL connection #%d to %s:%d...", $i+1, $server, $port);
+	    $sock = IO::Socket::SSL->start_SSL($osock);
+	    die "SSL error: " . IO::Socket::SSL::errstr() . $!  unless (defined($sock));
+	} 
+	else {
+	    $sock = $osock;
+	}
+
 	my $line = blockReadLine($sock);	# read server connection/response string
 	not $line =~ /^(200|201)/ and die "Unexpected server response: $line" . "Expected 200 or 201.\n";
+	if (ref($sock) eq "IO::Socket::SSL") {
+	    my ($subj, $iss, $cipher) = ($sock->peer_certificate("subject"),
+					 $sock->peer_certificate("issuer"),
+					 $sock->get_cipher());
+	    pc("cipher: $cipher: Subject $subj: Issuer: $iss\n", "bold white");
+	}
 	return ($sock, $line);
 }
 
@@ -640,10 +855,14 @@ sub doSingleLogin {
 	my $conn = $conn[$i];
 	my $sock = $conn[$i]->{'sock'};
 	not $silent and printf("Attempting login on connection #%d...", $i+1);
-	send $sock, "AUTHINFO USER $user\r\n", undef;
+
+	sockSend($sock, "AUTHINFO USER $user\r\n");
+
 	my $line = blockReadLine($sock);
 	if($line =~ /^381/){
-		send $sock, "AUTHINFO PASS $pw\r\n", undef;
+		
+		sockSend($sock, "AUTHINFO PASS $pw\r\n");
+		
 		$line = blockReadLine($sock);
 		$line =~ s/\r\n//;
 		(not $line =~ /^281/) and not $silent and print ">FAILED<\n* Authentication to server failed: ($line)\n" and exit(0);
@@ -901,19 +1120,25 @@ sub updateBWStartPts {
 #########################################################################################
 sub drawHeader(){
 	cursorPos(2, 1);
-	pc("nzbperl v.$version", 'bold red');
-	pc(" :: ", 'bold white');
-	#pc("by jason plumb ", 'bold red');
-	#pc("and ", 'bold white');
-	pc("noisybox.net", 'bold red');
-
 	my $len = 0;
+	$len += pc("nzbperl v.$version", 'bold red');
+	$len += pc(" :: ", 'bold white');
+	$len += pc("noisybox.net", 'bold red');
+	my $queuedCount = countQueuedNZBFiles();
+	if($queuedCount > 0){
+		$len += pc("  [", 'bold blue');
+		$len += pc(sprintf("+%d nzb files queued", $queuedCount), 'bold cyan');
+		$len += pc("]", 'bold blue');
+	}
+	pc((' ' x ($wchar-$len-4)), 'white');
+
 	cursorPos(2, 3);
 	$len += pc("Files remaining: ", 'bold white');
 	$len += pc($totals{'total file ct'}-$totals{'finished files'}, 'bold green');
+	#$len += pc(scalar(@queuefileset)+1, 'bold green');
 	$len += pc(" of ", 'white');
 	$len += pc($totals{'total file ct'}, 'bold green');
-	my $dlperc = int(100.0*$totals{'total bytes'} / $totals{'total size'});
+	my $dlperc = $totals{'total size'} == 0 ? 0 : int(100.0*$totals{'total bytes'} / $totals{'total size'});
 	$len += pc(' [', 'bold blue');
 	$len += pc(hrsv($totals{'total bytes'}) . 'B', 'bold green');
 	$len += pc('/', 'bold white');
@@ -955,7 +1180,8 @@ sub drawConnInfos(){
 
 		cursorPos(2, $startrow+(3*($i-1)));
 
-		if(!$conn->{'sock'}){	# connection closed
+		if(!defined($conn->{'sock'})){	# connection closed
+		#if(!$conn->{'sock'}->connected){	# connection closed
 			$len = pc(sprintf("%d: ", $i), 'bold white');
 			$len += pc("Connection is closed", 'bold red');
 			if($conn->{'sleep start'}){	# will be a reconnect
@@ -987,7 +1213,7 @@ sub drawConnInfos(){
 		my $segnum = $conn->{'segnum'}+1;
 		my $segct = scalar @{$conn->{'file'}->{'segments'}};
 		my $segbytesread = $conn->{'segbytes'};
-		my $cursegsize = @{$conn->{'file'}->{'segments'}}[$segnum-1]->{'size'};
+		my $cursegsize = @{$file->{'segments'}}[$segnum-1]->{'size'};
 
 		$len = pc(sprintf("%d: Downloading: ", $i), 'bold white');
 		my $fn = $file->{'name'};
@@ -1002,13 +1228,25 @@ sub drawConnInfos(){
 		cursorPos(2, $startrow+(3*($i-1))+1);
 		my $perc = 0;
 		$filesize and $perc = int(($filebytesread/$filesize)*25);
-		$len = pc("   |", 'bold white');
-		if($perc){
-			$len += pc('#' x ($perc-1), 'bold white');
-			$len += pc('#', 'bold red');
+		if ($noansi) {
+			($perc > 25) and $perc = 25;	# cap progress bar length
+			$len = pc("   |", 'bold white');
+			if($perc){
+				$len += pc('#' x ($perc-1), 'bold white');
+				$len += pc('#', 'bold red');
+			}
+			$len += pc('-' x (25-$perc), 'white');                                                                                                    
+			$len += pc("| ", 'bold white');                                                                                                           
+		} 
+		else {
+			$len = pc("\x1B(0" . "   [", 'bold white');
+			if($perc){
+				$len += pc('a' x ($perc-1), 'bold white');
+				$len += pc('a', 'bold red');
+			}
+			$len += pc('q' x (25-$perc), 'white');
+			$len += pc("] " . "\x1B(B", 'bold white');
 		}
-		$len += pc('-' x (25-$perc), 'white');
-		$len += pc("| ", 'bold white');
 		if($filesize){
 			$len += pc( sprintf("%2d", ($filebytesread/$filesize)*100) . "%", 'bold yellow');
 		}
@@ -1076,16 +1314,30 @@ sub drawStatusMsgs {
 sub drawBorder {
 	drawVLine(0);
 	drawVLine($wchar);
-	drawHLine(0);
-	drawHLine(4);
-	drawHLine(1+5+(3*$connct));
-	drawHLine(1+5+(3*$connct)+7);
+	drawHLine(0, "top");
+	drawHLine(4, "middle");
+	drawHLine(1+5+(3*$connct), "middle");
+	drawHLine(1+5+(3*$connct)+7, "bottom");
 }
 
 sub drawHLine {
 	my $ypos = shift;
+	my $hpos = shift;
 	cursorPos(0, $ypos);
-	pc('+' . ('-' x ($wchar-2)) . '+', 'bold white');
+	if ($noansi) {
+		pc('+' . ('-' x ($wchar-2)) . '+', 'bold white');
+	} 
+	else {
+		if ($hpos eq "top") {
+			pc("\x1B(0" . 'l' . ('q' x ($wchar-2)) . 'k' . "\x1B(B", 'bold white');
+		} 
+		elsif ($hpos eq "middle") {
+			pc("\x1B(0" . 't' . ('q' x ($wchar-2)) . 'u' . "\x1B(B", 'bold white');
+		} 
+		elsif ($hpos eq "bottom") {
+			pc("\x1B(0" . 'm' . ('q' x ($wchar-2)) . 'j' . "\x1B(B", 'bold white');
+		}
+	}
 }
 sub drawVLine {
 	my $xpos = shift;
@@ -1093,7 +1345,12 @@ sub drawVLine {
 	not $height and $height = (1+5+(3*$connct)+7);
 	foreach(0..$height){
 		cursorPos($xpos, $_);
-		pc('|', 'bold white');
+		if ($noansi) {
+			pc('|', 'bold white');
+		} 
+		else {
+			pc("\x1B(0" . "x" . "\x1B(B", 'bold white');
+		}
 	}
 }
 
@@ -1102,6 +1359,7 @@ sub drawVLine {
 #########################################################################################
 sub pc {
 	my ($string, $colstr) = @_;
+	!defined($colstr) and $colstr = "white";	# default to plain white
 	$daemon and return length($string);
 	if($usecolor){
 		print colored ($string, $colstr);
@@ -1125,6 +1383,19 @@ sub cursorPos {
 	!$daemon and 
 		$terminal->Tgoto('cm', $x, $y, *STDOUT);
 }
+
+#########################################################################################
+# Print or log, depending on $silent
+#########################################################################################
+#sub porl {
+#	$msg = shift;
+#	if($silent){
+#		statMsg($msg);
+#	}
+#	else{
+#		print $msg;
+#	}
+#}
 #########################################################################################
 # Adds a status message with timestamp
 #########################################################################################
@@ -1142,6 +1413,21 @@ sub statMsg {
 	return 1;
 }
 
+
+#########################################################################################
+# Socket send that can handle both SSL and regular socket...
+#########################################################################################
+sub sockSend {
+	my ($sock, $msg) = @_;
+	if (ref($sock) eq "IO::Socket::SSL") {
+	    $sock->syswrite($msg, undef);
+	} 
+	else {
+		send $sock, $msg, undef;
+	}
+}
+
+
 #########################################################################################
 # Reads a line from the socket in a blocking manner.
 #########################################################################################
@@ -1149,9 +1435,14 @@ sub blockReadLine {
 	my $sock = shift;
 	my ($line, $buff) = ('', '');
 	while(1){
-		sysread $sock, $buff, 1024 or last;
-		$line .= $buff;
-		last if $line =~ /\r\n$/;
+		if (ref($sock) eq "IO::Socket::SSL") {
+		    $sock->sysread($buff, 1024);
+		}
+		else{
+			defined(recv($sock, $buff, 1024, 0)) or last;
+		}
+	    $line .= $buff;
+	    last if $line =~ /\r\n$/;
 	}
 	return $line;
 }
@@ -1165,11 +1456,20 @@ sub disconnectAll {
 		my $sock = $conn[$i-1]->{'sock'}, 
 		print "Closing down connection #$i...";
 		not $sock and print "(already closed)\n" and next;
-		send $sock, "QUIT\r\n", undef;
+
+		sockSend($sock, "QUIT\r\n");
+
 		my $line = blockReadLine($sock);
 		$line =~ /^205/ and print "closed gracefully!";
 		print "\n";
-		close $sock;
+		if (ref($sock) eq "IO::Socket::SSL") {
+		    $sock->shutdown( 2 );
+		    $sock->close( SSL_no_shutdown => 1);
+		} 
+		else {
+		    #$sock->close;
+		    close($sock);
+		}
 		$conn[$i-1]->{'sock'} = undef;
 	}
 }
@@ -1220,6 +1520,7 @@ sub hrsv {
 sub readPassword {
 	ReadMode 2;	# no echo
 	my $pw = <STDIN>;
+	chomp $pw;
 	ReadMode 0; # default
 	print "\n";
 	return $pw;
@@ -1244,9 +1545,24 @@ sub computeTotalNZBSize {
 # for now, if you need it, use Dumper to view the format.  Should be self explanatory.
 #########################################################################################
 sub parseNZB {
-
 	my $nzbfilename = shift;
+	$nzbfiles{basename($nzbfilename)}->{'read'} = 1;
 	my $nzbdir = derivePath($nzbfilename);
+	if ((defined($dlpath)) and (defined($dlcreate))) {
+	    my $nzbbase = basename($nzbfilename);
+	    if ($nzbbase =~ /msgid_[0-9]*_(.*).nzb/) {
+			# Filter name from NewzBin style names
+			$nzbdir = $1 . "/";
+	    } 
+		elsif ($nzbbase =~ /(.*).nzb/) {
+			# Strip the .nzb extension and 
+			$nzbdir = $1 . "/";
+	    } 
+		else {
+			# Just use the nzb file as a directory itself
+			$nzbdir = $nzbbase . "/";
+	    }
+	}
 	my $parser = new XML::DOM::Parser;
 	my @fileset;
 	print "Loading and parsing nzb file: " . $nzbfilename . "\n";
@@ -1514,7 +1830,9 @@ sub avgFilesize {
 #########################################################################################
 sub handleCommandLineOptions {
 	my @saveargs = @ARGV;
+
 	GetOptions(%optionsmap);
+
 	if(-e $configfile){
 		readConfigFileOptions();
 	}
@@ -1525,16 +1843,18 @@ sub handleCommandLineOptions {
 	@ARGV = @saveargs;	# restore
 	GetOptions(%optionsmap);
 	if($help){
-		showUsage();
-		exit 1;
+		return 0;
 	}
 	$nocolor and $usecolor = 0;
 
-	if(not $ARGV[0]){		# No NZB file given?
-		print "Missing nzb file.\n";
-		showUsage(); 
-		exit;
+	if(not $ARGV[0] and (not defined $queuedir)){		# No NZB file given?
+		print "Missing nzb file or directory queue.\n";
+		return 0;
 	}
+	#if($ARGV[0] and (defined $queuedir)){ # Both nzb on commandline *and* a queue dir...we reject
+	#	print "You cannot specify an nzb file on the commandline\nwhen using --queuedir.\n";
+	#	return 0;
+	#}
 
 	if(not length($server)){
 		$server = $ENV{'NNTPSERVER'};
@@ -1550,14 +1870,72 @@ sub handleCommandLineOptions {
 
 	if($dropbad and $insane){	# conflicting
 		print "Error: --dropbad and --insane are conflicting (choose one)\n";
-		showUsage();
-		exit;
+		return 0;
 	}
+
+	if(defined($queuedir) and !$dropbad and !$insane){
+		print "Use of --queuedir requires either --dropbad or --insane.\n";
+		print "Please choose one and try again.\n";
+		return 0;
+	}
+
 	if($dlpath and $dlrelative){ # conflicting options
 		print "Error: --dlrelative and --dlpath <dir> are conflicting (choose one)\n";
-		showUsage();
-		exit;
+		return 0;
 	}
+
+	if($port == -1) {
+	    if (defined($ssl)) {
+			(undef, undef, $port, undef) = getservbyname("nntps", "tcp");
+	    } 
+		else {
+			(undef, undef, $port, undef) = getservbyname("nntp", "tcp");
+	    }
+	}
+
+	if(defined($socks_server) and defined($http_proxy_server)){
+		print "Error: --socks_server and --http_proxy are conflicting (choose one)\n";
+		return 0;
+	}
+
+	if (defined($ssl)) {
+	    eval "use IO::Socket::SSL;";		# use module only if option is enabled.
+		($@) and die "ERROR: --ssl was specified, but IO::Socket::SSL isn't available.\r\n" . 
+					"Please install IO::Socket::SSL to use --ssl and try again.\r\n";
+	}
+
+	if (defined($socks_server)) {	
+	    eval "use IO::Socket::Socks;"; 		# use module only if option enabled 
+		($@) and die "ERROR: --socks_server was specified, but IO::Socket::Socks isn't available.\r\n" . 
+					"Please install IO::Socket::Socks to use a SOCKS server and try again.\r\n";
+
+	    if ($socks_port == -1) {
+			if($socks_server =~ /:\d+$/){
+				$socks_port = $socks_server;
+				$socks_port =~ s/.*://;
+				$socks_server =~ s/:.*//;
+			} 
+			else {
+				(undef, undef, $socks_port, undef) = getservbyname("socks", "tcp");
+			}
+	    }
+	}
+
+	if (defined($http_proxy_server)) {
+	    eval "use Net::HTTPTunnel;";		# use module only if option enabled
+		($@) and die "ERROR: --http_proxy was specified, but Net::HTTPTunnel isn't available.\r\n" . 
+					"Please install Net::HTTPTunnel to use an HTTP proxy and try again.\r\n";
+
+		if($http_proxy_server =~ /:\d+$/){
+			$http_proxy_port = $http_proxy_server;
+			$http_proxy_port =~ s/.*://;
+			$http_proxy_server =~ s/:.*//;
+		} 
+		else {
+			(undef, undef, $http_proxy_port, undef) = getservbyname("webcache", "tcp");
+		}
+	}
+	return 1;
 }
 
 # Helper to detect that uudeview is installed.  Always a good idea, ya'know, since we're
@@ -1630,6 +2008,7 @@ sub checkForNewVersion {
 			print "..." . (9-$_);
 			sleep 1;
 		}
+		pc("\n");
 	}
 
 }
@@ -1675,8 +2054,8 @@ EOL
 ;
 	drawVLine(0, 17);
 	drawVLine($wchar, 17);
-	drawHLine(0);
-	drawHLine(17);
+	drawHLine(0, 'top');
+	drawHLine(17, 'bottom');
 
 	cursorPos(40, 14);
 	pc("ETA: " . getETA(), 'bold green');
@@ -1696,36 +2075,50 @@ print <<EOL
 
   where <options> are:
 
-  --config <file>   : Use <file> for config options (default is ~/.nzbperlrc)
-  --server <server> : Usenet server to use (defaults to NNTPSERVER env var)
-                    : Port can also be specified with --server <server:port>
-  --user <user>     : Username for server (blank of not needed)
-  --pw <pass>       : Password for server (blank to prompt if --user given)
-  --conn <n>        : Use <n> server connections (default = 2)
-  --keepparts       : Keep all encoded parts files on disk after decoding
-  --keepbroken      : Continue downloading files with broken/missing segments
-                    : and leave the parts files on disk still encoded.
-  --keepbrokenbin   : Decode and keep broken decoded files (binaries) on disk.
-  --dlrelative      : Download and decode to the dir that the nzbfiles are in
-                    : (default downloads to current directory)
-  --dlpath <dir>    : Download and decode all files to <dir>  
-                    : (default downloads to current dirctory)
-  --redo            : Don't skip over existing downloads, do them again
-  --insane          : Bypass NZB sanity checks completely
-  --dropbad         : Auto-skip files in the NZBs with suspected broken parts
-  --skip <n>        : Skip the first <n> files in the nzb (don't process)
-  --med <kBps>      : Set "med" bandwidth to kBps (default is 95kBps)
-  --low <kBps>      : Set "low" bandwidth to kBps (default is 35kBps)
-  --speed <speed>   : Explicitly specify transfer bandwidth in kBps
-  --log <file>      : Log status messages into <file> (default = none)
-  --daemon          : Run in background as daemon (use log for status)
-  --retrywait <n>   : Wait <n> seconds between reconnect tries (default = 300)
-  --nosort          : Don't sort files by name before processing
-  --filter <regex>  : Filter NZB contents on <regex> in subject line
-  --uudeview <app>  : Specify full path to uudeview (default found in \$PATH)
-  --nocolor         : Don't use color
-  --noupdate        : Don't check for newer versions at startup
-  --help            : Show this screen
+ --config <file>   : Use <file> for config options (default is ~/.nzbperlrc)
+ --server <server> : Usenet server to use (defaults to NNTPSERVER env var)
+                   : Port can also be specified with --server <server:port>
+ --user <user>     : Username for server (blank of not needed)
+ --pw <pass>       : Password for server (blank to prompt if --user given)
+ --conn <n>        : Use <n> server connections (default = 2)
+ --ssl             : Connect to server using SSL (secure sockets layer).
+                   : May be combined with --http_proxy or --socks_server to 
+                   : use a proxy server with SSL.
+ --socks_server <s>: Connect using <s> as a socks proxy server. Defaults to
+                   : port 1080, but can use --socks_server <server:port> to
+                   : use an alternative port.
+ --http_proxy <s>  : Use <s> as an http proxy server to use.  Defaults
+                   : to port 8080, but can use --http_proxy <server:port> to
+                   : use an alternative port.
+ --proxy_user <u>  : Authenticate to the proxy using <u> as the username
+ --proxy_passwd <p>: Use <p> as the proxy user password (otherwise prompted)
+ --keepparts       : Keep all encoded parts files on disk after decoding
+ --keepbroken      : Continue downloading files with broken/missing segments
+                   : and leave the parts files on disk still encoded.
+ --keepbrokenbin   : Decode and keep broken decoded files (binaries) on disk.
+ --dlpath <dir>    : Download and decode all files to <dir>  
+                   : (default downloads to current dirctory)
+ --dlrelative      : Download and decode to the dir that the nzbfiles are in
+                   : (default downloads to current directory)
+ --dlcreate        : Create download directories per nzb file
+ --queuedir <dir>  : Monitor <dir> for nzb files and queue new ones
+ --redo            : Don't skip over existing downloads, do them again
+ --insane          : Bypass NZB sanity checks completely
+ --dropbad         : Auto-skip files in the NZBs with suspected broken parts
+ --skip <n>        : Skip the first <n> files in the nzb (don't process)
+ --med <kBps>      : Set "med" bandwidth to kBps (default is 95kBps)
+ --low <kBps>      : Set "low" bandwidth to kBps (default is 35kBps)
+ --speed <speed>   : Explicitly specify transfer bandwidth in kBps
+ --log <file>      : Log status messages into <file> (default = none)
+ --daemon          : Run in background as daemon (use log for status)
+ --retrywait <n>   : Wait <n> seconds between reconnect tries (default = 300)
+ --nosort          : Don't sort files by name before processing
+ --filter <regex>  : Filter NZB contents on <regex> in subject line
+ --uudeview <app>  : Specify full path to uudeview (default found in \$PATH)
+ --nocolor         : Don't use color
+ --noansi          : Don't use ANSI characters (text only)
+ --noupdate        : Don't check for newer versions at startup
+ --help            : Show this screen
 
   During runtime, press 'h' or '?' to see a list of key commands.
 
