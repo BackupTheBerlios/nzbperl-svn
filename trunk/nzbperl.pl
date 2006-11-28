@@ -36,7 +36,7 @@ my $recv_chunksize = 5*1024;	# How big of chunks we read at once from a connecti
 my $UPDATE_URL = 'http://noisybox.net/computers/nzbperl/nzbperl_version.txt';
 
 my $dispchunkct = 250;			# Number of data lines to read between screen updates.
-my $targkBps = 0;
+#my $targkBps = 0;
 my ($medbw, $lowbw) = (95, 35);	# Defaults for low and medium speed settings.
 my $sleepdur = 0;				# Used when throttling
 
@@ -974,7 +974,7 @@ sub handleRcClientCmd {
 	}
 	elsif($cmd =~/^speed/i){
 		if($params =~ /\d+/){
-			$targkBps = $params;
+			$conf->targkBps($params);
 			$responsemsg = sprintf("Ok, set download speed to %dkBps", $params);
 		}
 		else{
@@ -1088,7 +1088,7 @@ sub getNewRcClients {
 sub generateRcSummary {
 	my %s;
 	$s{'connections'} = scalar @connections;
-	my $tspeed = $targkBps ? hrsv($targkBps*1024) . "Bps" : "unlimited";
+	my $tspeed = $conf->targkBps ? hrsv($conf->targkBps * 1024) . "Bps" : "unlimited";
 	$s{'speeds'} = {'current' => getCurrentSpeed(), 'target' => $tspeed, 'session' => getTotalSpeed()};
 	$s{'completed'} = {'files' => $totals{'finished files'}, 'size' => hrsv($totals{'total bytes'})};
 	$s{'completed'}->{'files'} = 0 unless $s{'completed'}->{'files'};
@@ -1226,12 +1226,12 @@ sub getch {
 # Does bandwidth throttling
 #########################################################################################
 sub doThrottling {
-	not $targkBps and return;		# Max setting, don't throttle.
+	not $conf->targkBps and return;	# Max setting, don't throttle.
 	$quitnow and return;			# Don't bother if quitting
 	my $curbps = getCurrentSpeed(1)/1024; # in kBps
 	# TODO: Using percentages could likely make this way better.
 	# (ie. inc/dec sleep duration by error percentage %)
-	if($curbps > $targkBps){		# We're going too fast...
+	if($curbps > $conf->targkBps){		# We're going too fast...
 		if($sleepdur == 0){
 			$sleepdur = 0.001;		# arbitrary 1ms add
 		}
@@ -1242,7 +1242,7 @@ sub doThrottling {
 			$sleepdur = 1.0;
 		}
 	}
-	elsif($curbps < $targkBps){
+	elsif($curbps < $conf->targkBps){
 		if($sleepdur > 0){
 			if($sleepdur < 0.00001){	# lowest thresshold at 10us
 				$sleepdur = 0;
@@ -1299,17 +1299,17 @@ sub handleKey {
 		drawStatusMsgs();
 	}
 	elsif($key =~ /1/){
-		$targkBps = $lowbw;
+		$conf->targkBps($lowbw);
 		statMsg("Setting bandwidth to low value ($lowbw" . "kBps)");
 		drawStatusMsgs();
 	}
 	elsif($key =~ /2/){
-		$targkBps = $medbw;
+		$conf->targkBps($medbw);
 		statMsg("Setting bandwidth to medium value ($medbw" . "kBps)");
 		drawStatusMsgs();
 	}
 	elsif($key =~ /3/){
-		$targkBps = 0;	# set to high 
+		$conf->targkBps(0);	# set to high 
 		statMsg("Setting bandwidth to maximum (unlimited)");
 		drawStatusMsgs();
 	}
@@ -1351,21 +1351,21 @@ sub handleKey {
 		}
 	}
 	elsif($key =~ /\+/){
-		if($targkBps){
-			$targkBps++;
-			statMsg("Nudging bandwidth setting up to " . $targkBps . "kBps");
+		if($conf->targkBps){
+			$conf->targkBps($conf->targkBps+1);
+			statMsg("Nudging bandwidth setting up to " . $conf->targkBps . "kBps");
 			drawStatusMsgs();
 		}
 	}
 	elsif($key =~ /-/){
-		if(!$targkBps){ # Set to unlimited
-			$targkBps = int(getCurrentSpeed(1)/1024)-1;
-			statMsg("Nudging bandwidth setting down to " . $targkBps . "kBps");
+		if(!$conf->targkBps){ # Set to unlimited
+			$conf->targkBps(int(getCurrentSpeed(1)/1024)-1);
+			statMsg("Nudging bandwidth setting down to " . $conf->targkBps . "kBps");
 			
 		}
-		elsif($targkBps > 1){ # Bottom out at 1
-			$targkBps--;
-			statMsg("Nudging bandwidth setting down to " . $targkBps . "kBps");
+		elsif($conf->targkBps > 1){ # Bottom out at 1
+			$conf->targkBps($conf->targkBps - 1);
+			statMsg("Nudging bandwidth setting down to " . $conf->targkBps . "kBps");
 		}
 		drawStatusMsgs();
 	}
@@ -1436,8 +1436,8 @@ sub drawHeader(){
 		$len += pc(" (", 'bold blue');
 		$len += pc("target", 'white');
 		$len += pc(' = ', 'white'); 
-		if($targkBps){
-			$len += pc(hrsv($targkBps*1024) . "Bps", 'bold green');
+		if($conf->targkBps){
+			$len += pc(hrsv($conf->targkBps * 1024) . "Bps", 'bold green');
 		}
 		else{
 			$len += pc("unlimited!", 'bold red');
@@ -2309,7 +2309,7 @@ our $AUTOLOAD;
 
 sub new {
 	my %fields = (
-		server => '', port => -1, user => '', pw => '', keepparts => 0, 
+		server => '', port => -1, user => '', pw => '', targkBps => 0, keepparts => 0, 
 		keepbroken => 0, keepbrokenbin => 0, help => 0, nosort => 0, overwritefiles => 0, 
 		connct => 2, nocolor => 0, logfile => undef, insane => 0, dropbad => 0, skipfilect => 0, 
 		reconndur => 300, filterregex => undef, configfile => "$ENV{HOME}/.nzbperlrc", uudeview => undef, daemon => 0, 
