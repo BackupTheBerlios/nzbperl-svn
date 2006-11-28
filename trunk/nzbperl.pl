@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 #
-# nzbperl.pl -- version 0.6.6
+# nzbperl.pl -- version 0.6.7
 # 
 # for more information:
 # http://noisybox.net/computers/nzbperl/ 
@@ -22,12 +22,6 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #########################################################################################
-#
-# General TODOs:
-#   * Consider putting tempfile (.parts files) in /tmp or other customize location
-#     perhaps with parameter
-#   * User specified output directory.
-#   * Other items listed on the project webpage :-)
 
 use strict;
 use File::Basename;
@@ -40,11 +34,10 @@ use Term::ReadKey;	# for no echo password reading
 use Term::Cap;
 use Cwd;
 
-my $version = '0.6.6';
+my $version = '0.6.7';
 my $ospeed = 9600; 
 my $terminal = Tgetent Term::Cap { TERM => undef, OSPEED => $ospeed };
 my $recv_chunksize = 5*1024;	# How big of chunks we read at once from a connection (this is pulled from ass)
-my $DECODE_DBG_FILE = '/tmp/nzbdbgout.txt';
 my $UPDATE_URL = 'http://noisybox.net/computers/nzbperl/nzbperl_version.txt';
 
 my $dispchunkct = 250;			# Number of data lines to read between screen updates.
@@ -63,8 +56,6 @@ my $skipthisfile = 0;
 my $usecolor = 1;
 my $logfile;
 
-$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
-
 # These are getting hefty, so they're now 5 per line
 my (	$server, $port, $user, $pw, $keepparts, 
 		$keepbroken, $keepbrokenbin, $help, $nosort, $overwritefiles, 
@@ -73,7 +64,8 @@ my (	$server, $port, $user, $pw, $keepparts,
 		$dlrelative, $dlpath, $noupdate, $ssl, $socks_server, 
 		$socks_port, $proxy_user, $proxy_passwd, $http_proxy_server, $http_proxy_port, 
 		$dlcreate, $dlcreategrp, $noansi, $queuedir, $rcport,
-		$nothread, $postDecProg, $postNzbProg, $ipv6, $forever
+		$postDecProg, $postNzbProg, $ipv6, $forever, $DECODE_DBG_FILE, 
+		$ifilterregex, $dthreadct
 		) =
 	(	'', -1, '', '', 0, 
 		0, 0, 0, 0, 0, 
@@ -82,7 +74,8 @@ my (	$server, $port, $user, $pw, $keepparts,
 		undef, undef, 0, undef, undef, 
 		-1, undef, undef, undef, -1, 
 		undef, undef, 0, undef, undef,
-		undef, undef, undef, undef, undef);
+		undef, undef, undef, undef, undef, 
+		undef, 1);
 
 # How commandline args are mapped to vars.  This map is also used by config file processor
 my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw, 
@@ -100,8 +93,9 @@ my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw,
 				'socks_user=s' => \$proxy_user, 'socks_passwd=s' => \$proxy_passwd,
 				'http_proxy=s' => \$http_proxy_server, 'dlcreate'=>\$dlcreate, 'dlcreategrp' => \$dlcreategrp,
 				'noansi' => \$noansi, 'queuedir=s' => \$queuedir, 'rcport=i' => \$rcport,
-				'nothread' => \$nothread, 'postdec=s' => \$postDecProg, 'postnzb=s' => \$postNzbProg,
-				'ipv6' => \$ipv6, 'chunksize=s' => \$recv_chunksize);
+				'postdec=s' => \$postDecProg, 'postnzb=s' => \$postNzbProg,
+				'ipv6' => \$ipv6, 'chunksize=s' => \$recv_chunksize, 'decodelog=s' => \$DECODE_DBG_FILE,
+				'ifilter=s' => \$ifilterregex, 'dthreadct=s' => \$dthreadct);
 
 if(defined(my $errmsg = handleCommandLineOptions())){
 	showUsage($errmsg); 
@@ -213,19 +207,20 @@ if($daemon){
 	#close STDERR;
 }
 
-# Start up the decoding thread...
-my ($decMsgQ, $decQ, $decThread);
-if(not defined($nothread)){
+# Start up the decoding thread(s)...
+my ($decMsgQ, $decQ, @decThreads);
+if(usingThreadedDecoding()){
 	$decMsgQ = Thread::Queue->new;	# For status msgs
 	$decQ = Thread::Queue->new;
-	$decThread = threads->new(\&file_decoder_thread);
+
+	foreach my $i (1..$dthreadct){
+		push @decThreads, threads->new(\&file_decoder_thread, $i);
+	}
 }
 
-my ($oldwchar, $wchar, $hchar, $wpixels, $hpixels) = (0);  	# holds screen size info
+my ($oldwchar, $wchar, $oldhchar, $hchar, $wpixels, $hpixels) = (0);  	# holds screen size info
 ($wchar, $hchar, $wpixels, $hpixels) = GetTerminalSize();
 clearScreen();
-
-unlink $DECODE_DBG_FILE;  # Clean up on each run
 
 my @queuefileset = @fileset;
 my @dlstarttime = Time::HiRes::gettimeofday();
@@ -256,9 +251,9 @@ while(1){
 	$done and last;
 }
 
-cursorPos(0, 1+5+(3*$connct)+9);
+cursorPos(0, $hchar);
 pc("All downloads complete!\n", 'bold white');
-cursorPos(0, (1+5+(3*$connct)+8));
+cursorPos(0, $hchar);
 
 if($quitnow){# Do some cleanups
 	foreach my $c (@conn){
@@ -274,9 +269,15 @@ if($quitnow){# Do some cleanups
 # TODO: Clean up server socket for remote control schtuff
 
 disconnectAll();
-pc("Waiting for file decoding thread to terminate...\n", 'bold white');
-$decQ->enqueue('quit now') unless defined($nothread);
-$decThread->join unless defined($nothread);
+pc("Waiting for file decoding thread(s) to terminate...\n", 'bold white');
+foreach my $i (1..$dthreadct){
+	# Send a quit now message for each decoder thread.
+	usingThreadedDecoding() and $decQ->enqueue('quit now');
+}
+foreach my $i (0..$dthreadct-1){
+	# Now join on every decoder thread, waiting for all to finish
+	usingThreadedDecoding() and $decThreads[$i]->join;
+}
 pc("Thanks for using ", 'bold yellow');
 pc("nzbperl", 'bold red');
 pc("! Enjoy!\n\n", 'bold yellow');
@@ -299,7 +300,10 @@ sub no_more_work_to_do {
 # messages back to the main thread.
 #########################################################################################
 sub file_decoder_thread {
+	my $threadNum = shift;
+
 	my ($nzbpath, $nzbfile, $isbroken, $islastonnzb, $tmpfilename, $truefilename, $decodedir);
+	my $prefixMsg = ($dthreadct > 1) ? "Decoder #$threadNum:" : '';
 
 	while(1){
 		# We get 6 things on the q per file...
@@ -315,8 +319,9 @@ sub file_decoder_thread {
 		$tmpfilename = $decQ->dequeue;
 		$decodedir = $decQ->dequeue;
 		$truefilename = $decQ->dequeue;
-		
-		doUUDeViewFile($nzbpath, $nzbfile, $isbroken, $islastonnzb, $tmpfilename, $decodedir, $truefilename);
+
+		doUUDeViewFile($nzbpath, $nzbfile, $isbroken, $islastonnzb, 
+						$tmpfilename, $decodedir, $truefilename, $prefixMsg);
 	}
 }
 #########################################################################################
@@ -688,7 +693,7 @@ sub doBodyRequests {
 }
 #########################################################################################
 # doStartFileDecoding - initiates or performs a decode for a completed file.
-# If nothread is set, this will decode in place, otherwise it just queues the request
+# If dthreadct == 0, this will decode in place, otherwise it just queues the request
 # to decode to the decoder thread.
 #########################################################################################
 sub doDecodeOrQueueCompletedFile {
@@ -716,13 +721,13 @@ sub doDecodeOrQueueCompletedFile {
 	$isbroken = 0 unless (defined($isbroken)); # ensure a definite value
 	my $islastonnzb = $file->{'lastonnzb'};
 
-	if($nothread){
-		doUUDeViewFile($file->{'nzb path'}, $file->{'nzb file'}, 
+	if(usingThreadedDecoding()){
+		# Queue the items to the decoding thread
+		$decQ->enqueue($file->{'nzb path'}, $file->{'nzb file'}, 
 			$isbroken, $islastonnzb, $tmpfilename, $outdir, $truefilename);
 	}
 	else{
-		# Queue the items to the decoding thread
-		$decQ->enqueue($file->{'nzb path'}, $file->{'nzb file'}, 
+		doUUDeViewFile($file->{'nzb path'}, $file->{'nzb file'}, 
 			$isbroken, $islastonnzb, $tmpfilename, $outdir, $truefilename);
 	}
 }
@@ -731,9 +736,14 @@ sub doDecodeOrQueueCompletedFile {
 # Decodes a file to disk and handles cleanup (deleting/keeping parts)
 #########################################################################################
 sub doUUDeViewFile {
-	my ($nzbpath, $nzbfile, $isbroken, $islastonnzb, $tmpfilename, $decodedir, $truefilename) = @_;
+	my ($nzbpath, $nzbfile, $isbroken, $islastonnzb, $tmpfilename, 
+		$decodedir, $truefilename, $prefixMsg) = @_;
 
-	statOrQ("Starting decode of $truefilename");
+	$prefixMsg = '' unless defined($prefixMsg);
+	$prefixMsg =~ s/\s+$//;
+	length($prefixMsg) and $prefixMsg .= ' ';
+
+	statOrQ($prefixMsg . "Starting decode of $truefilename");
 
 	# Do the decode and confirm that it worked...
 	# TODO: Make the debug file configurable and system flexible
@@ -741,14 +751,30 @@ sub doUUDeViewFile {
 	if(!$isbroken or $keepbrokenbin){
 		my $kb = '';
 		$keepbrokenbin and $kb = '-d';	# If keeping broken, pass -d (desparate mode) to uudeview
-		my $rc = system("$uudeview -i -a $kb -q \"$tmpfilename\" -p \"$decodedir\">> $DECODE_DBG_FILE 2>&1");
+		my $decodelogpart = '';
+		my $qopts = '-q';
+		if(defined($DECODE_DBG_FILE)){
+			$decodelogpart = " >> $DECODE_DBG_FILE";
+			$qopts = '-n';
+		}
+		else{
+			$decodelogpart = " > /dev/null";
+		}
+
+		my $rc = system("$uudeview -i -a $kb $qopts \"$tmpfilename\" -p \"$decodedir\"$decodelogpart 2>&1");
 		$rc and $isbroken = 1;	# If decode failed, file is broken
 
 		if($rc){		# Problem with the decode
-			statOrQ("FAILED decode of $tmpfilename (see $DECODE_DBG_FILE for details)");
+			if(defined($DECODE_DBG_FILE)){
+				statOrQ($prefixMsg . "FAILED decode of $tmpfilename (see $DECODE_DBG_FILE for details)");
+			}
+			else{
+				statOrQ($prefixMsg . "FAILED decode of $tmpfilename");
+				statOrQ("Consider using --decodelog <file> to troubleshoot.");
+			}
 		}
 		else{
-			statOrQ("Completed decode of " . $truefilename);
+			statOrQ($prefixMsg . "Completed decode of " . $truefilename);
 		}
 	}
 
@@ -803,7 +829,7 @@ sub runProgWithEnvParams {
 	# an external prog.  I wish there was a better way (like using $ENV, but
 	# that fails)
 	foreach my $k (keys %env){
-		$cmd .= sprintf("%s='%s' ", $k, $env{$k});
+		$cmd .= sprintf("%s='%s'; ", $k, $env{$k});
 	}
 	$cmd .= $prog;
 	statMsg("Running $desc program : $prog");
@@ -863,11 +889,17 @@ sub dequeueNextNZBFileIfNecessary {
 
 	foreach my $i (1..$connct){
 		if(not $conn[$i-1]->{'file'}){	# the connection is idle
-			queueNewNZBFilesFromDir(1);	# force a dircheck first
-			if(dequeueNextNZBFile()){
-				reconnectAllDisconnectedNow();
+			my ($newQueuedCt, $dequeuedNewFile, $reconnAttempts) = (0,0,0);
+
+			$newQueuedCt = queueNewNZBFilesFromDir(1);	# force a dircheck first
+			$dequeuedNewFile = dequeueNextNZBFile();
+			if($dequeuedNewFile){
+				$reconnAttempts = reconnectAllDisconnectedNow();
 			}
-			drawStatusMsgs();
+
+			if($newQueuedCt or $dequeuedNewFile or $reconnAttempts){
+				drawStatusMsgs();
+			}
 			return;
 		}
 	}
@@ -875,13 +907,18 @@ sub dequeueNextNZBFileIfNecessary {
 
 #########################################################################################
 # Forces an immediate reconnect on all not connected connections.
+# Returns number of connections that had reconnect *attempts* (not necessarily the 
+# number that were actually reconnected)
 #########################################################################################
 sub reconnectAllDisconnectedNow {
+	my $retCt = 0;
 	foreach my $i (1..$connct){
 		if(not defined($conn[$i-1]->{'sock'})){
 			doReconnectLogicPart($i-1, 1);
+			$retCt++;
 		}
 	}
+	return $retCt;
 }
 #########################################################################################
 # Pulls out the next nzb file in queue, parses it, and then add its files/parts to 
@@ -923,24 +960,26 @@ sub countQueuedNZBFiles {
 
 #########################################################################################
 # queues new nzb files from the queue dir if they exist and adds them to the hash/queue
-# of all nzb files we're processing.
+# of all nzb files we're processing.  Returns the number of files dequeued.
 #########################################################################################
 sub queueNewNZBFilesFromDir {
 	my $forcecheck = shift;
-	return unless $queuedir and not scalar @queuefileset;
-	return unless $forcecheck or (time - $lastdirchecktime > 15);	# don't check more than once every 15 seconds
+	return 0 unless $queuedir and not scalar @queuefileset;
+	return 0 unless $forcecheck or (time - $lastdirchecktime > 15);	# don't check more than once every 15 seconds
 	$lastdirchecktime = time;
 
+	my $retCt = 0;
 	opendir(QDIR, $queuedir);
 	my @candidates = grep(/\.nzb$/, readdir(QDIR));
 	foreach my $file (@candidates){
 		if( !defined($nzbfiles{'files'}->{$file})){	# not queued yet
 			statMsg("Queueing new nzb file found on disk: $file");
 			$nzbfiles{'files'}->{$file}->{'read'} = 0;
+			$retCt++;
 		}
 	}
 	closedir(QDIR);
-
+	return $retCt;
 }
 
 #########################################################################################
@@ -1032,6 +1071,15 @@ sub handleRcClientCmd {
 	elsif($cmd =~ /^summary/i){
 		$responsemsg = generateRcSummary();
 	}
+	elsif($cmd =~/^speed/i){
+		if($params =~ /\d+/){
+			$targkBps = $params;
+			$responsemsg = sprintf("Ok, set download speed to %dkBps", $params);
+		}
+		else{
+			$responsemsg = "Error: please specify speed in kBps";
+		}
+	}
 	elsif($cmd =~ /^enqueue/i){
 		if(defined($nzbfiles{'files'}->{$params})){	# not queued yet
 			$responsemsg = "Error: Refusing to queue file already queued ($params).";
@@ -1069,8 +1117,8 @@ sub readRcClientCommand {
 	if(defined($buff)){
 		my $nlindex = index $client->{'data'}, "\r\n";
 		if($nlindex >= 0){
-			my $cmd = substr $client->{'data'}, 0, $nlindex+2, '';
-			$client->{'data'} = substr $client->{'data'}, length($cmd);
+			#get cmd and replace in client{data} with nothing
+			my $cmd = substr $client->{'data'}, 0, $nlindex+2, '';	
 			$cmd =~ s/^\s+//; $cmd =~ s/\s+$//;
 			return $cmd;
 		}
@@ -1084,7 +1132,7 @@ sub readNewRcClientSockData {
 	my $client = shift;
 	my $sock = $client->{'sock'};
 	my $sockfn = fileno($sock);
-	my ($rin, $win, $ein) = ('', '');
+	my ($rin, $win, $ein) = ('', '', '');
 	my ($rout, $wout, $eout);
 	vec($rin, $sockfn, 1) = 1;
 	vec($win, $sockfn, 1) = 1;
@@ -1092,7 +1140,8 @@ sub readNewRcClientSockData {
 	my $nfound = select($rout=$rin, $wout=$win, $eout=$ein, 0);  
 	return undef unless $nfound > 0;
 	if(vec($rout, $sockfn,1) == 1){
-		recv $sock, my $buff, $recv_chunksize, undef;
+		my $buff;
+		recv($sock, $buff, $recv_chunksize, 0);
 		if(not length($buff)){
 			$client->{'closenow'} = 1;
 			return undef;
@@ -1336,10 +1385,10 @@ sub drawScreenAndHandleKeys {
 		cursorPos(40, 14);
 		pc("ETA: " . getETA(), 'bold green');
 		pc(")", 'bold white');
-		cursorPos(0, (1+5+(3*$connct)+8));
+		cursorPos(0, $hchar);
 	}
 	elsif((Time::HiRes::tv_interval(\@lastdrawtime) > 0.5) or # Refresh screen every 0.5sec max
-		((not defined $nothread) and $decMsgQ->pending > 0)){  # or we got status messages from decoder thread
+		(usingThreadedDecoding() and $decMsgQ->pending > 0)){  # or we got status messages from decoder thread
 
 		($wchar, $hchar, $wpixels, $hpixels) = GetTerminalSize();
 		if($oldwchar != $wchar){
@@ -1353,7 +1402,7 @@ sub drawScreenAndHandleKeys {
 		drawConnInfos();
 		drawStatusMsgs();
 
-		cursorPos(0, (1+5+(3*$connct)+8));
+		cursorPos(0, $hchar);
 		pc("'?' for help> ", 'bold white');
 	}
 	my $char;
@@ -1361,6 +1410,13 @@ sub drawScreenAndHandleKeys {
 		$char =~ s/[\r\n]//;
 		handleKey($char);
 	}
+}
+#########################################################################################
+# Simple helper to determine if we're using threaded or nonthreaded decoding.
+# It looks at the dthreadct variable and returns 1 if dthreadct > 0.
+#########################################################################################
+sub usingThreadedDecoding {
+	return ($dthreadct > 0);
 }
 #########################################################################################
 # getch -- gets a key in nonblocking mode
@@ -1686,11 +1742,11 @@ sub drawStatusMsgs {
 	return unless defined($wchar);	# to prevent decoder thread from trying to draw...
 
 	my $row = 3*$connct + 6 + 1;
-	my $statuslimit = 6;	# number of lines to show.
+	my $statuslimit = $hchar - 9 - (3*$connct);	# number of lines to show.
 
 	# Pull any decode messages from the queue and append them
 	# This might not be the *best* place for this...
-	while((not defined($nothread)) and $decMsgQ->pending > 0){
+	while(usingThreadedDecoding() and $decMsgQ->pending > 0){
 		statMsg($decMsgQ->dequeue);
 	}
 
@@ -1709,7 +1765,7 @@ sub drawStatusMsgs {
 		pc($line, 'white');
 		$row++;
 	}
-	cursorPos(0, (1+5+(3*$connct)+8));
+	cursorPos(0, $hchar);
 	pc("'?' for help> ", 'bold white');
 }
 
@@ -1722,7 +1778,7 @@ sub drawBorder {
 	drawHLine(0, "top");
 	drawHLine(4, "middle");
 	drawHLine(1+5+(3*$connct), "middle");
-	drawHLine(1+5+(3*$connct)+7, "bottom");
+	drawHLine($hchar-2, "bottom");
 }
 
 sub drawHLine {
@@ -1747,7 +1803,7 @@ sub drawHLine {
 sub drawVLine {
 	my $xpos = shift;
 	my $height = shift;
-	not $height and $height = (1+5+(3*$connct)+7);
+	not $height and $height = ($hchar-2);
 	foreach(0..$height){
 		cursorPos($xpos, $_);
 		if ($noansi) {
@@ -1810,15 +1866,16 @@ sub porlp {
 	}
 }
 #########################################################################################
-# statOrQ - calls statMsg or enqueues the message, based on the value of $nothread
+# statOrQ - calls statMsg or enqueues the message, based on the value of $dthreadct, 
+# which governs if we're using a threaded approach or not.
 #########################################################################################
 sub statOrQ {
 	my $msg = shift;
-	if($nothread){
-		statMsg($msg);
+	if(usingThreadedDecoding()){
+		$decMsgQ->enqueue($msg);
 	}
 	else{
-		$decMsgQ->enqueue($msg);
+		statMsg($msg);
 	}
 }
 #########################################################################################
@@ -1991,6 +2048,7 @@ sub parseNZB {
 			$nzbdir = $nzbbase . "/";
 	    }
 	}
+	$nzbdir .= '/' unless $nzbdir =~ /\/$/;
 	my $parser = new XML::DOM::Parser;
 	my @fileset;
 	porlp("Loading and parsing nzb file: " . $nzbfilename . "\n", $lognoprint);
@@ -2046,7 +2104,7 @@ sub parseNZB {
 			$seghash{'size'} = $size;
 			$seghash{'number'} = $segNumber;
 
-			$segments[$segNumber-1] = \%seghash;
+			push @segments, \%seghash;
 		}
 		$totalsegct += scalar @segments;
 		$file{'segments'} = \@segments;
@@ -2068,21 +2126,12 @@ sub parseNZB {
 #########################################################################################
 sub regexAndSkipping {
 	my @fileset = @_;
-	if(defined($filterregex)){
-		print "Filtering files on regular expression...\n";
-		my $orgsize = scalar @fileset;
-		my @nset;
-		while(scalar(@fileset) > 0){
-			my $f = shift @fileset;
-			if( $f->{'name'} =~ /$filterregex/){
-				push @nset, $f;
-			}
-		}
-		if(scalar @nset < 1){
-			pc("\nWhoops:  Filter removed all files (nothing left)...aborting!\n\n", 'bold yellow') and exit 0;
-		}
-		printf("Kept %d of %d files (filtered %d)\n", scalar(@nset), $orgsize, $orgsize-scalar(@nset));
-		@fileset = @nset;
+
+	if(defined($filterregex)){	# the inclusive filter
+		@fileset = filterFilesOnSubject(1, $filterregex, @fileset);
+	}
+	if(defined($ifilterregex)){	# the exclusive (inverse) filter
+		@fileset = filterFilesOnSubject(0, $ifilterregex, @fileset);
 	}
 
 	if($skipfilect){
@@ -2099,6 +2148,30 @@ sub regexAndSkipping {
 	
 	@fileset = resetLastOnNzbFlag(@fileset);
 	return @fileset;
+}
+
+#########################################################################################
+# Takes in a list of files and filters them based on subject.
+#########################################################################################
+sub filterFilesOnSubject {
+	my $inclusiveRegex = shift;
+	my $regex = shift;
+	my @fileset = @_;
+	print "Filtering files on " . ($inclusiveRegex ? '' : 'inverse ') . "regular expression...\n";
+	my $orgsize = scalar @fileset;
+	my @nset;
+	while(scalar(@fileset) > 0){
+		my $f = shift @fileset;
+		if( ($inclusiveRegex and ($f->{'name'} =~ /$regex/)) or
+			( not $inclusiveRegex and (not $f->{'name'} =~ /$regex/))){
+			push @nset, $f;
+		}
+	}
+	if(scalar @nset < 1){
+		pc("\nWhoops:  Filter removed all files (nothing left)...aborting!\n\n", 'bold yellow') and exit 0;
+	}
+	printf("Kept %d of %d files (filtered %d)\n", scalar(@nset), $orgsize, $orgsize-scalar(@nset));
+	return @nset;
 }
 
 #########################################################################################
@@ -2333,9 +2406,12 @@ sub handleCommandLineOptions {
 
 	not $optionsAreOk and return "";
 
-	if(not defined($nothread)){
+	if(usingThreadedDecoding()){
+		eval "
 		use threads;
-		use Thread::Queue;
+		use Thread::Queue;";
+		($@) and return "ERROR: Could not use Perl thread modules.\r\n" .
+		" Try setting --dthreadct 0 to run with a single threaded Perl.";
 	}
 
 	if($recv_chunksize =~ /kb?$/i){
@@ -2360,14 +2436,16 @@ sub handleCommandLineOptions {
 		$server =~ s/:.*//;
 	}
 
-	$dlpath = cwd unless defined($dlpath);
-	if(not $dlpath =~ /^\//){
+	$dlpath = cwd unless (defined($dlpath) or defined($dlrelative));
+	if($dlpath and not $dlpath =~ /^\//){
 		return "--dlpath must specify an ABSOLUTE (not relative) path.";
 	}
 
 	# Make sure that dlpath ends with a slash
-	$dlpath and (not ($dlpath =~ /\/$/)) and ($dlpath .= '/');
-	($dlpath =~ m#^([\w\d\s\.\_\-\/\\]+)$#) and $dlpath = $1;	# untaint dlpath
+	if($dlpath and (not ($dlpath =~ /\/$/))){
+		$dlpath .= '/';
+		($dlpath =~ m#^([\w\d\s\.\_\-\/\\]+)$#) and $dlpath = $1;	# untaint dlpath
+	}
 
 	if($dropbad and $insane){	# conflicting
 		return "Error: --dropbad and --insane are conflicting (choose one)";
@@ -2390,6 +2468,15 @@ sub handleCommandLineOptions {
 
 	if($dlpath and $dlrelative){ # conflicting options
 		return "Error: --dlrelative and --dlpath <dir> are conflicting (choose one)";
+	}
+
+	if(defined($DECODE_DBG_FILE)){
+		if(open(DBGTMP,">$DECODE_DBG_FILE")){
+			close DBGTMP;	#all good
+		}
+		else{
+			return "The decode log file '$DECODE_DBG_FILE' is unwritable!";
+		}
 	}
 
 	if($port == -1) {
@@ -2636,8 +2723,10 @@ print <<EOL
  --low <kBps>      : Set "low" bandwidth to kBps (default is 35kBps)
  --speed <speed>   : Explicitly specify transfer bandwidth in kBps
  --log <file>      : Log status messages into <file> (default = none)
- --nothread        : Don't decode files in a thread (single threaded operation)
-                   : (Note: Causes downloads to be paused during file decoding)
+ --decodelog <file>: Append uudeview output into <file> (default = none)
+ --dthreadct <ct>  : Use <ct> number of decoder threads.  Set ct = 0 for single
+                     threaded perl operation.  (Note: When ct = 0, downloads
+                     will be paused during file decoding)
  --daemon          : Run in background as daemon (use log for status)
  --rcport <port>   : Enable remote control functionality on port <port>
  --retrywait <n>   : Wait <n> seconds between reconnect tries (default = 300)
@@ -2645,6 +2734,7 @@ print <<EOL
  --chunksize       : Amount to read on each recv() call (for tweakers only)
                    : Default = 5k, Can specify in bytes or kb (ie. 5120 or 5k)
  --filter <regex>  : Filter NZB contents on <regex> in subject line
+ --ifilter <regex> : Inverse filter NZB contents on <regex> in subject line
  --uudeview <app>  : Specify full path to uudeview (default found in \$PATH)
  --nocolor         : Don't use color
  --noansi          : Don't use ANSI characters (text only)
