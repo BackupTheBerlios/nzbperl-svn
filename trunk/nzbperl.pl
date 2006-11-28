@@ -2559,6 +2559,7 @@ sub handleCommandLineOptions {
 
 sub hostport {
 	my ($class, $host, $port) = @_;
+	$port = -1;
 	if($host =~ /:\d+$/){
 		$port = $host;
 		$port =~ s/.*://;
