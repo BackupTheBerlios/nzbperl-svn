@@ -107,19 +107,19 @@ sub test_getNextNzb {
 	$self->assert_equals('/path/to/fonzie.nzb', $q->getNextNzb());
 }
 
-sub test_dequeueSegPullsFromPending {
+sub test_popCompletedFiles {
 	my $self = shift;
 	my $q = Nzb::Queue->new();
-
-	$q->queueNzb($self->_buildSimpleNzb('1.nzb'));
-	$q->queueNzb($self->_buildSimpleNzb('2.nzb'));
-	$self->assert_equals(2, $q->pendingNzbFileCount);
-
-	foreach (0..4){
-		print "DEBUG:\n";
-		$q->getNextSegment();
-	}
-	$self->assert_equals(0, $q->pendingNzbFileCount);
+	$self->assert_equals(0, scalar $q->popCompletedFiles);
+	my $nzb = $self->_buildSimpleNzb();
+	$q->queueNzb($nzb);
+	$self->assert_equals(2, $q->pendingFileCount());
+	my @f1seg = $nzb->files()->[0]->segments();
+	$f1seg[0]->markAsComplete();
+	$f1seg[1]->markAsComplete();
+	$self->assert_equals(1, scalar $q->popCompletedFiles);
+	# After popping we're left with just one
+	$self->assert_equals(1, $q->pendingFileCount());
 }
 
 # Create nzb file with 2 files inside, each with 2 segments

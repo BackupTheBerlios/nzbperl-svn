@@ -996,7 +996,7 @@ sub handleRcClientCmd {
 		else{
 			$responsemsg = "Queueing new nzb file found on disk: $params";
 			statMsg($responsemsg);
-			$queue->addNewFile($params);
+			$queue->addNewFilename($params);
 		}
 	}
 	else{
