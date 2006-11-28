@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# nzbperl.pl -- version 0.6
+# nzbperl.pl -- version 0.6.1
 # 
 # for more information:
 # http://noisybox.net/computers/nzbperl/ 
@@ -38,7 +38,7 @@ use Time::HiRes;	# timer stuff
 use Term::ReadKey;	# for no echo password reading
 use Term::Cap;
 
-my $version = '0.6';
+my $version = '0.6.1';
 my $ospeed;
 my $terminal = Tgetent Term::Cap { TERM => undef, OSPEED => $ospeed };
 my $recv_chunksize = 5*1024;	# How big of chunks we read at once from a connection (this is pulled from ass)
@@ -122,6 +122,8 @@ if($user){
 
 $terminal->Tputs('cl', 1, *STDOUT);			# clears screen
 my ($oldwchar, $wchar, $hchar, $wpixels, $hpixels);  	# holds screen size info
+
+unlink $DECODE_DBG_FILE;  # Clean up on each run
 
 my @queuefileset = @fileset;
 my @dlstarttime = Time::HiRes::gettimeofday();
@@ -342,10 +344,10 @@ sub doBodyRequests {
 
 				# Do the decode and confirm that it worked...
 				# TODO: Make the debug file configurable and system flexible
-				my $rc = system("uudeview -i -a $keep -q \"$tmpfilename\" 2>&1> $DECODE_DBG_FILE");
+				my $rc = system("uudeview -i -a $keep -q \"$tmpfilename\" >> $DECODE_DBG_FILE 2>&1");
 
 				if($rc){		# Problem with the decode
-					statMsg("Decode of $tmpfilename failed (see $DECODE_DBG_FILE for details)");
+					statMsg("FAILED decode of $tmpfilename (see $DECODE_DBG_FILE for details)");
 
 					if(length($keep) == 0){		# If we're keeping files...
 						statMsg("Keeping segments in $tmpfilename (--keep given)");
@@ -976,7 +978,7 @@ sub hrsv {
 	if($k > 1){
 		return sprintf("%dk", $k);
 	}
-	return $size;
+	return sprintf("%0.2f", $size);
 }
 
 #########################################################################################
