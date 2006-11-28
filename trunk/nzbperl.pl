@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 #
-# nzbperl.pl -- version 0.6.7
+# nzbperl.pl -- version 0.6.8
 # 
 # for more information:
 # http://noisybox.net/computers/nzbperl/ 
@@ -34,7 +34,7 @@ use Term::ReadKey;	# for no echo password reading
 use Term::Cap;
 use Cwd;
 
-my $version = '0.6.7';
+my $version = '0.6.8';
 my $ospeed = 9600; 
 my $terminal = Tgetent Term::Cap { TERM => undef, OSPEED => $ospeed };
 my $recv_chunksize = 5*1024;	# How big of chunks we read at once from a connection (this is pulled from ass)
@@ -65,7 +65,7 @@ my (	$server, $port, $user, $pw, $keepparts,
 		$socks_port, $proxy_user, $proxy_passwd, $http_proxy_server, $http_proxy_port, 
 		$dlcreate, $dlcreategrp, $noansi, $queuedir, $rcport,
 		$postDecProg, $postNzbProg, $ipv6, $forever, $DECODE_DBG_FILE, 
-		$ifilterregex, $dthreadct
+		$ifilterregex, $dthreadct, $diskfree
 		) =
 	(	'', -1, '', '', 0, 
 		0, 0, 0, 0, 0, 
@@ -75,7 +75,7 @@ my (	$server, $port, $user, $pw, $keepparts,
 		-1, undef, undef, undef, -1, 
 		undef, undef, 0, undef, undef,
 		undef, undef, undef, undef, undef, 
-		undef, 1);
+		undef, 1, undef);
 
 # How commandline args are mapped to vars.  This map is also used by config file processor
 my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw, 
@@ -95,7 +95,7 @@ my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw,
 				'noansi' => \$noansi, 'queuedir=s' => \$queuedir, 'rcport=i' => \$rcport,
 				'postdec=s' => \$postDecProg, 'postnzb=s' => \$postNzbProg,
 				'ipv6' => \$ipv6, 'chunksize=s' => \$recv_chunksize, 'decodelog=s' => \$DECODE_DBG_FILE,
-				'ifilter=s' => \$ifilterregex, 'dthreadct=s' => \$dthreadct);
+				'ifilter=s' => \$ifilterregex, 'dthreadct=s' => \$dthreadct, 'diskfree=s' => \$diskfree);
 
 if(defined(my $errmsg = handleCommandLineOptions())){
 	showUsage($errmsg); 
@@ -128,7 +128,9 @@ if(defined($proxy_user) and not defined($proxy_passwd)){
 }
 
 
-my $lastdirchecktime = 0;
+my $lastDirCheckTime = 0;
+my $lastDiskFullTime = undef;
+my $lastDiskFreePerc = 0;
 my %nzbfiles;	# the hash/queue of nzb files we're handling
 # $nzbfiles{'files'}->{<filename>}->{'read'}     : 1 if we've parsed/loaded it
 # $nzbfiles{'files'}->{<filename>}->{'finished'} : 1 if all files have been downloaded
@@ -445,26 +447,11 @@ sub spoolOutConnBuffData {
 				$conn->{'truefname'} = $tfn;
 				statMsg("Conn. $i: Found true filename: $tfn");
 
-				my $tfndisk = $tfn;			# Find out where it's going on disk...
+				my $targdir = getDestDirForFile($conn->{'file'}); # where the file is going on disk
+				makeTargetDirIfNecessary($targdir);
 
-				if(defined($dlpath)){
-					if (defined($dlcreate)) {	# if we like to create nicely organized subdirs
-						my $targdir = $dlpath . $conn->{'file'}->{'nzb path'};
-						mkdir $targdir unless (-d $targdir);
-						$tfndisk = $targdir . "$tfn";
-					} 
-					elsif (defined($dlcreategrp)){
-						my $targdir = $dlpath . $conn->{'file'}->{'groups'}->[0];
-						mkdir $targdir unless (-d $targdir);
-						$tfndisk = $targdir . "$tfn";
-					}
-					else {
-						$tfndisk = $dlpath . $tfn;
-					}
-				}
-				elsif(defined($dlrelative)){
-					$tfndisk = $conn->{'file'}->{'nzb path'} . $tfn;
-				}
+				my $tfndisk = $targdir . $tfn;
+
 				if(-e $tfndisk){
 					if(!$overwritefiles){
 						# We can't just close and delete, because there will likely still be 
@@ -497,6 +484,39 @@ sub spoolOutConnBuffData {
 		else{
 			$line =~ s/^\.\././o;
 			print {$conn->{'tmpfile'}} $line;
+		}
+	}
+}
+
+#########################################################################################
+# Figures out where a file will be going on disk.  Returns the directory.
+#########################################################################################
+sub getDestDirForFile {
+	my $file = shift;
+	if(defined($dlpath)){
+		if (defined($dlcreate)) {	# if we like to create nicely organized subdirs
+			return $dlpath . $file->{'nzb path'};
+		} 
+		elsif (defined($dlcreategrp)){
+			return $dlpath . $file->{'groups'}->[0];
+		}
+		return $dlpath;
+	}
+	elsif(defined($dlrelative)){
+		return $file->{'nzb path'};
+	}
+	return undef;	#this should not happen...either dlpath or dlrelative should be set
+}
+
+#########################################################################################
+# makes the given dowload dir if necessary
+#########################################################################################
+sub makeTargetDirIfNecessary {
+	my $targdir = shift;
+	if( not -d ($targdir) and defined($dlpath) and 
+		(defined($dlcreate) or defined($dlcreategrp))){
+		if(!mkdir($targdir)){
+			statMsg("ERROR: Could not create $targdir: $!");
 		}
 	}
 }
@@ -700,21 +720,9 @@ sub doDecodeOrQueueCompletedFile {
 	my $conn = shift;
 	my $file = $conn->{'file'};
 	undef $conn->{'tmpfile'};	# causes a close
-	my $outdir = cwd;	# default to current dir
-	if(defined($dlpath)){
-		if (defined($dlcreate)) {
-			$outdir = $dlpath . $file->{'nzb path'};
-		} 
-		elsif(defined($dlcreategrp)){
-			$outdir = $dlpath . $file->{'groups'}->[0];
-		}
-		else {
-			$outdir = $dlpath;
-		}
-	}
-	elsif(defined($dlrelative)){
-		$outdir = $file->{'nzb path'};	# extract to same dir as nzb file
-	}
+	my $outdir = getDestDirForFile($file);
+	$outdir = cwd unless defined($outdir); # default to current dir
+
 	my $tmpfilename = $conn->{'tmpfilename'};
 	my $truefilename = $conn->{'truefname'};
 	my $isbroken = $conn->{'isbroken'};
@@ -746,8 +754,6 @@ sub doUUDeViewFile {
 	statOrQ($prefixMsg . "Starting decode of $truefilename");
 
 	# Do the decode and confirm that it worked...
-	# TODO: Make the debug file configurable and system flexible
-
 	if(!$isbroken or $keepbrokenbin){
 		my $kb = '';
 		$keepbrokenbin and $kb = '-d';	# If keeping broken, pass -d (desparate mode) to uudeview
@@ -829,7 +835,10 @@ sub runProgWithEnvParams {
 	# an external prog.  I wish there was a better way (like using $ENV, but
 	# that fails)
 	foreach my $k (keys %env){
-		$cmd .= sprintf("%s='%s'; ", $k, $env{$k});
+		my $envitem = $env{$k};
+		$envitem =~ s/"/\\"/g;		# escape double quotes
+		$envitem =~ s/`/\\`/g;		# escape backticks (evil)
+		$cmd .= sprintf("export %s=\"%s\"; ", $k, $envitem);
 	}
 	$cmd .= $prog;
 	statMsg("Running $desc program : $prog");
@@ -846,6 +855,10 @@ sub doFileAssignments {
 		my $conn = $conn[$i-1];
 		next if $conn->{'file'};	# already working on a file
 
+		if(hitDiskSpaceLimit($queuefileset[0])){	# Do free space checking if option set
+			next;
+		}
+		
 		my $file = shift @queuefileset;
 		last unless $file;
 
@@ -866,6 +879,10 @@ sub doFileAssignments {
 		}
 		elsif(defined($dlrelative)){ # otherwise stick in relative dir to nzbfile
 			$tmpfile = $file->{'nzb path'} . $tmpfile;
+			if(not -w $file->{'nzb path'}){
+				statMsg(sprintf("*** ERROR: nzb path %s is not writable!  There will be failures!", $file->{'nzb path'}));
+				statMsg("*** Please change the permissions or use --dlpath instead of --dlrelative.");
+			}
 		}
 
 		($tmpfile =~ m#^([\w\d\s\.\_\-\/\\]+)$#) and $tmpfile = $1;	# untaint tmpfile
@@ -877,6 +894,46 @@ sub doFileAssignments {
 		statMsg("Opened temp file $tmpfile");
 		binmode $conn->{'tmpfile'};
 	}
+}
+
+#########################################################################################
+# Returns 1 if the param to prevent disk filling was set and we're within the threshhold
+#########################################################################################
+sub hitDiskSpaceLimit {
+	return 0 unless defined $diskfree;
+	my $file = shift;
+
+	# Only check freespace every 15 seconds
+	if(defined($lastDiskFullTime)){
+		return 1 unless (time - $lastDiskFullTime) > 15;
+	}
+
+	my $freeperc = getFreeDiskPercentage(getDestDirForFile($file));
+	if($freeperc <= $diskfree){
+		if(not defined($lastDiskFullTime)){ # the first time we detect free space is out
+			statMsg("Warning: Download disk has less than $diskfree% free.");
+			statMsg("Waiting for free space before continuing downloading.");
+		}
+		$lastDiskFullTime = time;
+		return 1;
+	}
+	$lastDiskFullTime = undef;
+	return 0;
+}
+
+#########################################################################################
+# Tries to get the free disk percentage on the provided path
+#########################################################################################
+sub getFreeDiskPercentage {
+	my $path = shift;
+	my @reslines = `df '$path'`;
+	my $line = pop @reslines;
+	chomp $line;
+	# Are all dfs created equal???  If not, we could use col headers?
+	my ($fs, $size, $used, $avail, $dfperc, $mount) = split /\s+/, $line; 
+	$dfperc =~ s/%//;
+	$lastDiskFreePerc = 100-$dfperc;
+	return $lastDiskFreePerc;
 }
 
 #########################################################################################
@@ -965,8 +1022,8 @@ sub countQueuedNZBFiles {
 sub queueNewNZBFilesFromDir {
 	my $forcecheck = shift;
 	return 0 unless $queuedir and not scalar @queuefileset;
-	return 0 unless $forcecheck or (time - $lastdirchecktime > 15);	# don't check more than once every 15 seconds
-	$lastdirchecktime = time;
+	return 0 unless $forcecheck or (time - $lastDirCheckTime > 15);	# don't check more than once every 15 seconds
+	$lastDirCheckTime = time;
 
 	my $retCt = 0;
 	opendir(QDIR, $queuedir);
@@ -1080,6 +1137,11 @@ sub handleRcClientCmd {
 			$responsemsg = "Error: please specify speed in kBps";
 		}
 	}
+	elsif($cmd =~ /^diskfree/i){
+		$params =~ s/%//;
+		$diskfree = $params;
+		$responsemsg = "Ok, set max disk free percentage to $diskfree%";
+	}
 	elsif($cmd =~ /^enqueue/i){
 		if(defined($nzbfiles{'files'}->{$params})){	# not queued yet
 			$responsemsg = "Error: Refusing to queue file already queued ($params).";
@@ -1119,7 +1181,7 @@ sub readRcClientCommand {
 		if($nlindex >= 0){
 			#get cmd and replace in client{data} with nothing
 			my $cmd = substr $client->{'data'}, 0, $nlindex+2, '';	
-			$cmd =~ s/^\s+//; $cmd =~ s/\s+$//;
+			$cmd = trimWS($cmd);
 			return $cmd;
 		}
 	}
@@ -1649,6 +1711,14 @@ sub drawConnInfos(){
 											"   <waiting for others to finish>", 'bold cyan');
 				pc((' ' x ($wchar-$len-4)), 'white');
 			}
+			elsif(defined($lastDiskFullTime)) {		# connection waiting on free disk space
+				$len = pc(sprintf("%d: Waiting for free space on disk...[%d%% free, limit %d%%]", $i, $lastDiskFreePerc, $diskfree), 'bold yellow');
+				pc((' ' x ($wchar-$len-4)), 'white');
+				cursorPos(2, $startrow+(3*($i-1))+1);
+				$len = pc(sprintf("   <last check was %d%% free, limit is %d%%>", $lastDiskFreePerc, $diskfree), 'bold white');
+				pc((' ' x ($wchar-$len-4)), 'white');
+			}
+
 			next;
 		}
 
@@ -1950,7 +2020,6 @@ sub disconnectAll {
 		    $sock->close( SSL_no_shutdown => 1);
 		} 
 		else {
-		    #$sock->close;
 		    close($sock);
 		}
 		$conn[$i-1]->{'sock'} = undef;
@@ -2057,8 +2126,7 @@ sub parseNZB {
 		$nzbdoc = $parser->parsefile($nzbfilename);
 	};
 	if($@){
-		my $errmsg = $@;
-		$errmsg =~ s/^\s+//; $errmsg =~ s/\s+$//;
+		my $errmsg = trimWS($@);
 		if($lognoprint){
 			statMsg("The nzb file is BROKEN and the XML could not be parsed.");
 		}
@@ -2106,6 +2174,13 @@ sub parseNZB {
 
 			push @segments, \%seghash;
 		}
+
+		# If segment numbers are present, use them to sort.
+		if (defined($segments[0]) && defined($segments[0]->{'number'})){
+			@segments = sort {
+				$a->{'number'} <=> $b->{'number'} } @segments;
+		}
+		
 		$totalsegct += scalar @segments;
 		$file{'segments'} = \@segments;
 
@@ -2426,15 +2501,16 @@ sub handleCommandLineOptions {
 		return "Missing nzb file or directory queue.";
 	}
 
-	if(not length($server)){
-		$server = $ENV{'NNTPSERVER'};
-		not $server and return "Must provide --server or set \$NNTPSERVER environment";
-	}
 	if($server =~ /:\d+$/){
 		$port = $server;
 		$port =~ s/.*://;
 		$server =~ s/:.*//;
 	}
+	if(not length($server)){
+		$server = $ENV{'NNTPSERVER'};
+		not $server and return "Must provide --server or set \$NNTPSERVER environment";
+	}
+	$server = trimWS($server);
 
 	$dlpath = cwd unless (defined($dlpath) or defined($dlrelative));
 	if($dlpath and not $dlpath =~ /^\//){
@@ -2468,6 +2544,12 @@ sub handleCommandLineOptions {
 
 	if($dlpath and $dlrelative){ # conflicting options
 		return "Error: --dlrelative and --dlpath <dir> are conflicting (choose one)";
+	}
+
+	# Verify that output dir is writable...
+	if(defined($dlpath) and not -w $dlpath) {
+		return "Error: dlpath '$dlpath' is not writable!\n" .
+				" Please change the permissions or use a different directory.";
 	}
 
 	if(defined($DECODE_DBG_FILE)){
@@ -2516,6 +2598,7 @@ sub handleCommandLineOptions {
 				(undef, undef, $socks_port, undef) = getservbyname("socks", "tcp");
 			}
 	    }
+		$socks_server = trimWS($socks_server);
 	}
 
 	if (defined($http_proxy_server)) {
@@ -2531,6 +2614,7 @@ sub handleCommandLineOptions {
 		else {
 			(undef, undef, $http_proxy_port, undef) = getservbyname("webcache", "tcp");
 		}
+		$http_proxy_server = trimWS($http_proxy_server);
 	}
 
 	if(defined($ipv6)){
@@ -2580,7 +2664,8 @@ sub readConfigFileOptions(){
 	while($line = <CFG>){
 		chomp $line;
 		$line =~ s/^\s+//;
-		$line =~ s/^-+//;	# In case dashes in config file
+		$line =~ s/^-+//;				# In case dashes in config file
+		$line =~ s/(\s+)?=(\s+)?/=/;	# Remove whitespace around equals sign
 		next if $line =~ /^#/;
 		next unless length($line);
 		push @opts, "--$line";
@@ -2588,6 +2673,18 @@ sub readConfigFileOptions(){
 	close CFG;
 	@ARGV = @opts;
 }
+
+#########################################################################################
+# Trim ws on both sides of string.  Undef is ok.
+#########################################################################################
+sub trimWS {
+	my $s = shift;
+	return $s unless defined $s;
+	$s =~ s/^\s+//;
+	$s =~ s/\s+$//;
+	return $s;
+}
+
 #########################################################################################
 # Checks for a newer version, disabled with --noupdate
 #########################################################################################
@@ -2600,6 +2697,12 @@ sub checkForNewVersion {
 		return;
 	}
 	my $remote_ver = eval "get \"$UPDATE_URL\"";
+	if(!defined($remote_ver)){
+		pc("Error fetching current version during update check: $!\n", 'bold red');
+		pc("Skipping up-to-date check.\n", 'bold yellow');
+		return;
+	}
+
 	chomp $remote_ver;
 
 	if($remote_ver eq $version){
@@ -2715,6 +2818,7 @@ print <<EOL
  --forever         : Run forever, waiting for new nzbs (requires --queuedir)
  --postdec <prog>  : Run <prog> after each file is decoded, env var params.
  --postnzb <prog>  : Run <prog> after each NZB file is completed.
+ --diskfree <perc> : Stop downloading when dir free space above <perc>
  --redo            : Don't skip over existing downloads, do them again
  --insane          : Bypass NZB sanity checks completely
  --dropbad         : Auto-skip files in the NZBs with suspected broken parts
