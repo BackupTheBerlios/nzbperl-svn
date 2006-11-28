@@ -72,14 +72,17 @@ sub test_haveSeen {
 	$self->assert(not $q->haveSeen('neverseen.nzb'));
 	$q->queueNzb($self->_buildSimpleNzb);
 	$self->assert($q->haveSeen('nzbfile.nzb'));
-
-	$self->fail("TODO: Ensure path information isn't important");
+	$self->assert($q->haveSeen('/any/path/to/nzbfile.nzb'));
+	$q->addNewFilename('/path1/to/my.nzb');
+	$self->assert($q->haveSeen('/any/path/to/my.nzb'));
 }
 
 sub test_addNewFilename {
 	my $self = shift;
 	my $q = Nzb::Queue->new();
-	$self->fail("TODO: Build me");
+	$self->assert_equals(1, $q->addNewFilename('first.nzb'));
+	$self->assert_equals(1, $q->addNewFilename('first.nzb'));
+	$self->assert_equals(2, $q->addNewFilename('second.nzb'));
 }
 
 sub test_getNextSegment {
@@ -96,13 +99,21 @@ sub test_getNextSegment {
 	$self->assert_null($q->getNextSegment());
 }
 
+sub test_getNextNzb {
+	my $self = shift;
+	my $q = Nzb::Queue->new();
+	$self->assert(not defined($q->getNextNzb()));	# nothing pending
+	$q->addNewFilename('/path/to/fonzie.nzb');
+	$self->assert_equals('/path/to/fonzie.nzb', $q->getNextNzb());
+}
+
 sub test_dequeueSegPullsFromPending {
 	my $self = shift;
 	my $q = Nzb::Queue->new();
 
-	$q->queueNzb($self->_buildSimpleNzb);
-	$q->queueNzb($self->_buildSimpleNzb);
-	$self->assert_equals(1, $q->pendingNzbFileCount);
+	$q->queueNzb($self->_buildSimpleNzb('1.nzb'));
+	$q->queueNzb($self->_buildSimpleNzb('2.nzb'));
+	$self->assert_equals(2, $q->pendingNzbFileCount);
 
 	foreach (0..4){
 		print "DEBUG:\n";
@@ -134,11 +145,6 @@ sub test_computeTotalNzbSize {
 
 	$q->queueNzb($self->_buildSimpleNzb);
 	$self->assert_equals(4*256, $q->computeTotalNzbSize());
-}
-
-sub test_haveAlreadyQueued {
-	my $self = shift;
-	$self->fail("build me");
 }
 
 sub test_isEmpty {

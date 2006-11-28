@@ -60,9 +60,6 @@ my @statusmsgs;
 my $lastDirCheckTime = 0;
 my $lastDiskFullTime = undef;
 my $lastDiskFreePerc = 0;
-my %nzbfiles;	# the hash/queue of nzb files we're handling
-# $nzbfiles{'files'}->{<filename>}->{'read'}     : 1 if we've parsed/loaded it
-# $nzbfiles{'files'}->{<filename>}->{'finished'} : 1 if all files have been downloaded
 my @lastdrawtime;
 my @connections;
 my ($decMsgQ, $decQ, @decThreads);
@@ -142,8 +139,8 @@ while(scalar(@ARGV) > 0){
 	'total bytes' => 0,
 	'total file ct' => $queue->pendingFileCount()
 );
-print "Looks like we've got " . $queue->pendingNzbFileCount() . " nzb files with " . 
-	$queue->pendingFileCount() . " possible files ahead of us.\n";
+print "Looks like we've got " . $queue->pendingFileCount() . " possible files coming (with " . 
+	$queue->pendingNzbFileCount() . " nzb files queued).\n";
 
 startRemoteControl();
 
@@ -826,29 +823,35 @@ sub reconnectAllDisconnectedNow {
 	return $retCt;
 }
 #########################################################################################
-# Pulls out the next nzb file in queue, parses it, and then add its files/parts to 
-# @queuefileset.
+# Pulls out the next nzb file in queue, parses it, and keeps on truckin.
+# Return 
 #########################################################################################
 sub dequeueNextNZBFile {
-	my @keys = keys %{$nzbfiles{'files'}};
-	foreach my $key (@keys){
-		if(not $nzbfiles{'files'}->{$key}->{'read'}){
-			statMsg("Moving to next nzb file in queue: $key");
-			my @newset = parseNZB($conf->queuedir . '/' . $key, 1);
-			if(!defined($newset[0])){
-				statMsg("Warning: no new files loaded from queued nzb file");
-				return 0;
-			}
-			$queue->queue_files(@newset);
-			statMsg("Loaded " . scalar(@newset) . " new files to download from nzb file: $key");
-			$totals{'total file ct'} += scalar @newset;
-			$totals{'total size'} += $queue->computeTotalNzbSize();
-			$nzbfiles{'files'}->{$key}->{'read'} = 1;
-			return 1;
-		}
-	}
-	return 0;
+	my $nextFilename = $queue->getNextNzb();
+	return 0 unless defined($nextFilename);
+	statMsg("Moving to next nzb file in queue: $nextFilename");
+	return $queue->queueNzb(parseNZB($nextFilename));
 }
+#sub dequeueNextNZBFile {
+#	my @keys = keys %{$nzbfiles{'files'}};
+#	foreach my $key (@keys){
+#		if(not $nzbfiles{'files'}->{$key}->{'read'}){
+#			statMsg("Moving to next nzb file in queue: $key");
+#			my @newset = parseNZB($conf->queuedir . '/' . $key, 1);
+#			if(!defined($newset[0])){
+#				statMsg("Warning: no new files loaded from queued nzb file");
+#				return 0;
+#			}
+#			$queue->queue_files(@newset);
+#			statMsg("Loaded " . scalar(@newset) . " new files to download from nzb file: $key");
+#			$totals{'total file ct'} += scalar @newset;
+#			$totals{'total size'} += $queue->computeTotalNzbSize();
+#			$nzbfiles{'files'}->{$key}->{'read'} = 1;
+#			return 1;
+#		}
+#	}
+#	return 0;
+#}
 
 #########################################################################################
 # queues new nzb files from the queue dir if they exist and adds them to the hash/queue
@@ -865,7 +868,7 @@ sub queueNewNZBFilesFromDir {
 	my @candidates = grep(/\.nzb$/, readdir(QDIR));
 	foreach my $file (@candidates){
 
-		if(not $queue->haveAlreadyQueued($file)){
+		if(not $queue->haveSeen($file)){
 			statMsg("Queueing new nzb file found on disk: $file");
 			# TODO: Fix me
 		}
@@ -984,7 +987,7 @@ sub handleRcClientCmd {
 		$responsemsg = "Ok, set max disk free percentage to " . $conf->diskfree . "%";
 	}
 	elsif($cmd =~ /^enqueue/i){
-		if(defined($nzbfiles{'files'}->{$params})){	# not queued yet
+		if($queue->haveSeen($params)){	# new file, not seen before...
 			$responsemsg = "Error: Refusing to queue file already queued ($params).";
 		}
 		elsif(not -e $params){
@@ -993,7 +996,7 @@ sub handleRcClientCmd {
 		else{
 			$responsemsg = "Queueing new nzb file found on disk: $params";
 			statMsg($responsemsg);
-			$nzbfiles{'files'}->{$params}->{'read'} = 0;
+			$queue->addNewFile($params);
 		}
 	}
 	else{
@@ -1816,7 +1819,6 @@ sub parseAndEnqueueNzbFile {
 sub parseNZB {
 	my $nzbfilename = shift;
 	my $lognoprint = shift;
-	$nzbfiles{'files'}->{basename($nzbfilename)}->{'read'} = 1;	# set flag indicating we've processed it
 
 	my $fullNzbFilename = derivePath($nzbfilename);
 	$fullNzbFilename .= '/' unless $fullNzbFilename =~ /\/$/;
@@ -2641,7 +2643,7 @@ sub getDestDirForFile {
 package Nzb::Queue;
 use strict;
 use fields;
-use Data::Dumper;
+use File::Basename;
 
 sub new {
 	my $class = shift;
@@ -2667,9 +2669,8 @@ sub queueNzb {
 	my ($queue, $nzbfile) = @_;
 	return scalar @{$queue->{files}} unless $nzbfile;	# Don't add undef param file
 
-	#printf("DEBUG: haveSeen for %s gives %s\n", $nzbfile->nzbFile, $queue->haveSeen($nzbfile->nzbFile));
 	$queue->haveSeen($nzbfile->nzbFile) and return scalar @{$queue->{files}};
-	push @{$queue->{seenFilenames}}, $nzbfile->nzbFile;
+	$queue->_addSeen($nzbfile->nzbFile);
 
 	push @{$queue->{files}}, $nzbfile;
 	return scalar @{$queue->{files}};
@@ -2677,7 +2678,13 @@ sub queueNzb {
 
 sub haveSeen {
 	my ($queue, $filename) = @_;
+	$filename = basename($filename);
 	return scalar grep(/$filename/, @{$queue->{seenFilenames}});
+}
+
+sub _addSeen {
+	my ($queue, $filename) = @_;
+	push @{$queue->{seenFilenames}}, $filename;
 }
 
 # Adds a new filename to the list of unparsed nzb files, but only
@@ -2687,6 +2694,7 @@ sub addNewFilename {
 	my ($queue, $filename) = @_;
 	if(not $queue->haveSeen($filename)){
 		push @{$queue->{newFilenames}}, $filename;
+		$queue->_addSeen($filename);
 	}
 	return $queue->pendingNzbFileCount;
 }
@@ -2718,9 +2726,10 @@ sub pendingFileCount {
 	return $ret;
 }
 
-sub haveAlreadyQueued {
-	my ($queue, $filename) = @_;
-	die "TODO: BUILD THIS.";
+# Pop next nzb filename from the pending queue, or return undef
+sub getNextNzb {
+	my $queue = shift;
+	return pop @{$queue->{newFilenames}};
 }
 
 #########################################################################################
@@ -2750,8 +2759,8 @@ sub getNextSegment {
 		$queue->{segmentIndex}++;
 
 		if($queue->{nzbFileIndex} >= scalar @{$queue->{files}}){	# Roll to next (pending?) nzb file
-
-			# TODO: Also need to see if we have files waiting to be parsed into us first
+			$queue->{segmentIndex} = 0;
+			$queue->{fileIndex} = 0;
 			return undef;
 		}
 
