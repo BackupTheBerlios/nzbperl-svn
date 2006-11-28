@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 #
-# nzbperl.pl -- version 0.6.1
+# nzbperl.pl -- version 0.6.2
 # 
 # for more information:
 # http://noisybox.net/computers/nzbperl/ 
@@ -27,7 +27,6 @@
 #   * Consider putting tempfile (.parts files) in /tmp or other customize location
 #     perhaps with parameter
 #   * User specified output directory.
-#   * Possibly doing regex filtering on filenames in nzb file?
 #   * Other items listed on the project webpage :-)
 
 use strict;
@@ -38,7 +37,7 @@ use Time::HiRes;	# timer stuff
 use Term::ReadKey;	# for no echo password reading
 use Term::Cap;
 
-my $version = '0.6.1';
+my $version = '0.6.2';
 my $ospeed;
 my $terminal = Tgetent Term::Cap { TERM => undef, OSPEED => $ospeed };
 my $recv_chunksize = 5*1024;	# How big of chunks we read at once from a connection (this is pulled from ass)
@@ -59,9 +58,21 @@ my $showinghelpscreen = 0;
 my $skipthisfile = 0;
 my $usecolor = 1;
 my $logfile;
-my ($server, $port, $user, $pw, $keep, $help, $nosort, 
-    $overwritefiles, $connct, $nocolor, $insane, $dropbad, $skipfilect) =
-	('', 119, '', '', 0, 0, 0, 0, 2, 0, 0, 0, 0);
+my ($server, $port, $user, $pw, $keepparts, $keepbroken, $keepbrokenbin, $help, $nosort, 
+    $overwritefiles, $connct, $nocolor, $insane, 
+	$dropbad, $skipfilect, $reconndur, $filterregex, $configfile) =
+	('', 119, '', '', 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 300, undef, "$ENV{HOME}/.nzbperlrc");
+
+# How commandline args are mapped to vars.  This map is also used by config file processor
+my %optionsmap = ('server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw, 
+				'help' => \$help, 'med=s' => \$medbw, 'low=s' => \$lowbw, 
+				'speed=s' => \$targkBps, 'keepparts' => \$keepparts, 
+				'keepbroken' => \$keepbroken, 'keepbrokenbin' => \$keepbrokenbin, 
+				'nosort' => \$nosort, 'redo' => \$overwritefiles, 'conn=i' => \$connct, 
+				'nocolor' => \$nocolor, 'log=s' => \$logfile,
+				'insane' => \$insane, 'dropbad' => \$dropbad,
+				'skip=i' => \$skipfilect, 'retrywait=i' => \$reconndur,
+				'filter=s' => \$filterregex, 'config=s' => \$configfile);
 
 handleCommandLineOptions();
 if(not $nocolor){
@@ -110,6 +121,8 @@ statMsg('Welcome -- nzbperl started!');
 # $conn->{'truefname'}  : true filename on disk (assumed after decoding)
 # $conn->{'skipping'}   : indicates we're in the middle of a skipping operation
 # $conn->{'last data'}  : time when data was last seen on this channel
+# $conn->{'sleep start'}: time that we started sleeping (for retries)
+# $conn->{'isbroken'}   : set when one or more parts fails to download
 
 $totals{'total file ct'} = scalar @fileset;
 
@@ -179,16 +192,38 @@ sub doReceiverPart {
 	my ($rout, $eout);
 
 	foreach my $i (1..$connct){
+		next unless ($conn[$i-1]->{'sock'});
 		vec($rin, fileno($conn[$i-1]->{'sock'}), 1) = 1;
 		vec($ein, fileno($conn[$i-1]->{'sock'}), 1) = 1;
 	}
 
 	my $nfound = select($rout=$rin, undef, $eout=$ein, 0.25);  
+	#statMsg("DEBUG: after select (nfound = $nfound)");
 
 	foreach my $i (1..$connct){
 		my $conn = $conn[$i-1];
+
+		if(!$conn->{'sock'}){
+			doReconnectLogicPart($i-1);
+			#statMsg("DEBUG: skipping cuz sock closed");
+			next;
+		}
+		
 		if(vec($rout, fileno($conn->{'sock'}),1) == 1){
-			recv $conn->{'sock'}, my $buff, $recv_chunksize, undef;
+			my $recvret = recv $conn->{'sock'}, my $buff, $recv_chunksize, undef;
+
+			#statMsg(sprintf("DEBUG: bstatus = %s", $conn->{'bstatus'}));
+			#statMsg("DEBUG: buff just got: $buff");
+
+			if(!defined($recvret) or !length($buff)){
+				# TODO: Determine how to gracefully handle the crap we've already downloaded 
+				close($conn->{'sock'});
+				$conn->{'sock'} = undef;
+				$conn->{'sleep start'} = time;
+				statMsg(sprintf("* Remote disconnect on connection #%d", $i));
+				drawStatusMsgs();
+			}
+			
 			$conn->{'buff'} .= $buff;
 
 			if(not ($conn->{'bstatus'} =~ /starting/)){ # only bump these up if we're not starting...
@@ -204,30 +239,51 @@ sub doReceiverPart {
 				my $ind1 = index $conn->{'buff'}, "\r\n";
 				last unless $ind1 >= 0;
 				my $line = substr $conn->{'buff'}, 0, $ind1+2, '';
-				$line =~ s/^\.\././o;
 
 				if($conn->{'bstatus'} =~ /starting/){
+
+					#statMsg(sprintf("DEBUG: buffer has %d lines", scalar split /\r\n/s, $conn->{'buff'}));
+					
+					my ($mcode, $msize, $mbody, $mid) = split /\s+/, $line;
+					#statMsg("DEBUG: msize for this line is $msize");
+
 					# We're just starting, need to slurp up 222 (or other) response
 					if($line =~ /^2\d\d\s.*\r\n/s){
-						#$conn[$i-1]->{'buff'} =~ s/2\d\d\s.*\r\n//;
-						$conn->{'segbytes'} = length($conn->{'buff'});
-						#print "DEBUG: We got the 222 (or whatever) server response...\n";
+						# Bad case where server sends a 5xx message after a 2xx (222)
+						if(!$msize and ($conn->{'buff'} =~ /^5\d\d /)){
+							# Handle this error condition (display message to user)
+							my $errline = $conn->{'buff'};
+							$errline =~ s/\r\n.*//s;
+							statMsg(sprintf("Conn. %d: Server returned error: %s", $i, $errline));
+						}
+						else{
+							#$conn[$i-1]->{'buff'} =~ s/2\d\d\s.*\r\n//;
+							$conn->{'segbytes'} = length($conn->{'buff'});
+						}
 						$conn->{'bstatus'} = 'running';
 					}
-					else{ # This is likely an error condition -- often when the server can't find a segment
+					else{ # This is an error condition -- often when the server can't find a segment
 						$line =~ s/\r\n$//;
 						statMsg( sprintf("Conn. %d FAILED to fetch part #%d (%s)", $i, 
 										$conn->{'segnum'}+1, $line));
 						drawStatusMsgs();
 						$conn->{'bstatus'} = 'finished';  # Flag BODY segment as finished
+						$conn->{'isbroken'} = 1;
 
 
 						# Ok, so now that a segment fetch FAILED, we need to determine how to continue...
-						# We will look at the keep variable to determine how to continue...
-						# If keep is set, we will keep downloading parts...otherwise we will bump
+						# We will look at the keep variables to determine how to continue...
+						# If keepbroken or keepbrokenbin are set, we will keep downloading parts...otherwise we will bump
 						# up the segnum so that we skip all remaining segments (if any)
 						
-						if(length($keep)){		# If we're NOT keeping files...
+						if($keepbroken or $keepbrokenbin){		# If we shound continue downloading this broken file
+							# Subtract the size of the current segment from the totals
+							# (for this file and for the grand totals)
+							my $failedsegsize = @{$conn->{'file'}->{'segments'}}[$conn->{'segnum'}]->{'size'};
+							$totals{'total size'} -= $failedsegsize ;
+							$conn->{'file'}->{'totalsize'} -= $failedsegsize;
+						}
+						else{
 							statMsg(sprintf("Conn. %d aborting file (failed to fetch segment #%d)", 
 									$i, $conn->{'segnum'}+1));
 							
@@ -241,13 +297,6 @@ sub doReceiverPart {
 							close $conn->{'tmpfile'};
 							unlink $conn->{'tmpfilename'};
 							$conn->{'file'} = undef;
-						}
-						else{
-							# Subtract the size of the current segment from the totals
-							# (for this file and for the grand totals)
-							my $failedsegsize = @{$conn->{'file'}->{'segments'}}[$conn->{'segnum'}]->{'size'};
-							$totals{'total size'} -= $failedsegsize ;
-							$conn->{'file'}->{'totalsize'} -= $failedsegsize;
 						}
 					}
 					next;
@@ -288,6 +337,8 @@ sub doReceiverPart {
 					last;
 				}
 				else{
+					$line =~ s/^\.\././o;
+					#statMsg("DEBUG: line is $line");
 					print {$conn->{'tmpfile'}} $line;
 				}
 			}
@@ -295,6 +346,46 @@ sub doReceiverPart {
 		drawScreenAndHandleKeys();
 		doThrottling();
 	}
+
+	if($nfound == 0){	# No active connections, need to repaint anyway
+		drawScreenAndHandleKeys();
+		doThrottling();
+	}
+}
+
+
+#########################################################################################
+# Handles reconnection logic
+#########################################################################################
+sub doReconnectLogicPart {
+	my $i = shift;
+	my $conn = $conn[$i];
+
+	my $remain = $reconndur - (time - $conn->{'sleep start'});
+	if($remain > 0){	# still sleeping
+		return;
+	}
+	my $iaddr = inet_aton($server) || die "Error resolving host: $server";
+	my $paddr = sockaddr_in($port, $iaddr);
+
+	statMsg(sprintf("Connection #%d attempting reconnect to %s:%d...", $i+1, $server, $port));
+	($conn->{'sock'}, my $line) = createSingleConnection($i, $paddr, 1);
+
+	my $msg = sprintf("Connection #%d reestablished.", $i+1);
+	$user and $msg .= "..performing login";
+	statMsg($msg);
+	drawStatusMsgs();
+
+	if($user){	#need to authenticate...
+		doSingleLogin($i, 1);
+		statMsg(sprintf("Login on connection #%d complete.", $i+1));
+	}
+
+	$conn->{'sleep start'} = undef;
+	# These two lines reset our state so that we restart the segment we were on
+	# prior to the disconnect.  Sure, a bit convoluted, but it's used elsewhere.
+	$conn->{'bstatus'} = 'finished';
+	$conn->{'segnum'}--;
 }
 
 #########################################################################################
@@ -340,25 +431,34 @@ sub doBodyRequests {
 			if($conn->{'segnum'} >= scalar @{$file->{'segments'}}){ # All segments for this file exhausted.
 				close $conn[$i-1]->{'tmpfile'};
 				my $tmpfilename = $conn[$i-1]->{'tmpfilename'};
-				showDecodingStartStopMsg($i-1, 'start');
 
-				# Do the decode and confirm that it worked...
-				# TODO: Make the debug file configurable and system flexible
-				my $rc = system("uudeview -i -a $keep -q \"$tmpfilename\" >> $DECODE_DBG_FILE 2>&1");
+				if( (!$conn->{'isbroken'}) or $keepbrokenbin){
+					showDecodingStartStopMsg($i-1, 'start');
 
-				if($rc){		# Problem with the decode
-					statMsg("FAILED decode of $tmpfilename (see $DECODE_DBG_FILE for details)");
+					# Do the decode and confirm that it worked...
+					# TODO: Make the debug file configurable and system flexible
+					my $kb = '';
+					$keepbrokenbin and $kb = '-d';	# If keeping broken, pass -d (desparate mode) to uudeview
+					my $rc = system("uudeview -i -a $kb -q \"$tmpfilename\" >> $DECODE_DBG_FILE 2>&1");
+					$rc and $conn->{'isbroken'} = 1;	# If decode failed, file is broken
 
-					if(length($keep) == 0){		# If we're keeping files...
-						statMsg("Keeping segments in $tmpfilename (--keep given)");
+					showDecodingStartStopMsg($i-1, 'stop');
+
+					if($rc){		# Problem with the decode
+						statMsg("FAILED decode of $tmpfilename (see $DECODE_DBG_FILE for details)");
 					}
 					else{
-						(unlink $tmpfilename) or statMsg("Error removing $tmpfilename from disk");
-						# TODO: Skip to next file...
+						statMsg("Completed decode of " . $conn[$i-1]->{'truefname'});
 					}
 				}
-				else{
-					statMsg("Completed decode of " . $conn[$i-1]->{'truefname'});
+
+				# Decide if we need to keep or delete the temp .parts file
+				if($keepparts or ($conn->{'isbroken'} and $keepbroken)){
+					my $brokemsg = $conn->{'isbroken'} ? ' broken' : '';
+					statMsg("Keeping$brokemsg file segments in $tmpfilename (--keepparts given)");
+				}
+				else {
+					(unlink $tmpfilename) or statMsg("Error removing $tmpfilename from disk");
 				}
 
 				drawStatusMsgs();
@@ -395,7 +495,6 @@ sub doFileAssignments {
 		$conn->{'filebytes'} = 0;
 		$conn->{'truefname'} = undef;
 		$conn->{'bwstartbytes'} = 0;
-		#@{$conn->{'fstarttime'}} = Time::HiRes::gettimeofday();
 		@{$conn->{'bwstarttime'}} = Time::HiRes::gettimeofday();
 
 		# Create temp filename and open
@@ -418,16 +517,25 @@ sub createConnections {
 	my $paddr = sockaddr_in($port, $iaddr);
 
 	foreach my $i (1..$connct){
-		my $sock;
-		socket($sock, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die "Error creating socket: $!";
-		print "Attempting connection #$i to $server...";
-		connect($sock, $paddr) || die "Error connecting: $!";
-		print "success!\n";
-		my $line = blockReadLine($sock);	# read server connection/response string
-		not $line =~ /^(200|201)/ and die "Unexpected server response: $line" . "Expected 200 or 201.\n";
-		$conn[$i-1]->{'sock'} = $sock;
+		($conn[$i-1]->{'sock'}, my $line) = createSingleConnection($i-1, $paddr);
 	}
 	return 1;
+}
+
+#########################################################################################
+# Connects to an NNTP server and attempts to read the greet string line.
+# Returns the socket and the greet line.
+#########################################################################################
+sub createSingleConnection {
+	my ($i, $paddr, $silent) = @_;
+	my $sock;
+	socket($sock, PF_INET, SOCK_STREAM, getprotobyname('tcp')) || die "Error creating socket: $!";
+	not $silent and printf("Attempting connection #%d to %s...", $i+1, $server);
+	connect($sock, $paddr) || die "Error connecting: $!";
+	not $silent and print "success!\n";
+	my $line = blockReadLine($sock);	# read server connection/response string
+	not $line =~ /^(200|201)/ and die "Unexpected server response: $line" . "Expected 200 or 201.\n";
+	return ($sock, $line);
 }
 
 #########################################################################################
@@ -435,26 +543,35 @@ sub createConnections {
 #########################################################################################
 sub doLogins {
 	foreach my $i (1..$connct){
-		my $sock = $conn[$i-1]->{'sock'};
-		print "Attempting login on connection #$i...";
-		send $sock, "AUTHINFO USER $user\r\n", undef;
-		my $line = blockReadLine($sock);
-		if($line =~ /^381/){
-			send $sock, "AUTHINFO PASS $pw\r\n", undef;
-			$line = blockReadLine($sock);
-			$line =~ s/\r\n//;
-			(not $line =~ /^281/) and print ">FAILED<\n* Authentication to server failed: ($line)\n" and exit(0);
-			print "success!\n";
-		}
-		elsif($line =~ /^281/){ # not sure if this happens, but this means no pw needed I guess
-			print "no password needed, success!\n";
-		}
-		else {
-			print "server returned: $line\n";
-			die ">LOGIN FAILED<\n";
-		}
+		doSingleLogin($i-1);
 	}
 	return 1;
+}
+
+#########################################################################################
+# Logs in a single connection.  Pass in the connection index.
+#########################################################################################
+sub doSingleLogin {
+	my ($i, $silent) = @_;
+	my $conn = $conn[$i];
+	my $sock = $conn[$i]->{'sock'};
+	not $silent and printf("Attempting login on connection #%d...", $i+1);
+	send $sock, "AUTHINFO USER $user\r\n", undef;
+	my $line = blockReadLine($sock);
+	if($line =~ /^381/){
+		send $sock, "AUTHINFO PASS $pw\r\n", undef;
+		$line = blockReadLine($sock);
+		$line =~ s/\r\n//;
+		(not $line =~ /^281/) and not $silent and print ">FAILED<\n* Authentication to server failed: ($line)\n" and exit(0);
+		not $silent and print "success!\n";
+	}
+	elsif($line =~ /^281/){ # not sure if this happens, but this means no pw needed I guess
+		not $silent and print "no password needed, success!\n";
+	}
+	else {
+		not $silent and print "server returned: $line\n";
+		die ">LOGIN FAILED<\n";
+	}
 }
 
 #########################################################################################
@@ -506,6 +623,9 @@ sub getCurrentSpeed {
 	  $h = int($etasec/(60*60));
 	  $m = int(($etasec-(60*60*$h))/60);
 	  $s = $etasec-(60*60*$h)-(60*$m);
+	  if($h > 240){	# likely bogus...just punt
+		 return "??:??:??";
+	  }
 	  return sprintf("%.2d:%.2d:%.2d", $h, $m, $s);
 	}
 }
@@ -538,6 +658,7 @@ sub drawScreenAndHandleKeys {
 	}
 	my $char;
 	while (defined ($char = getch()) ) {	# have a key
+		$char =~ s/[\r\n]//;
 		handleKey($char);
 	}
 }
@@ -629,11 +750,8 @@ sub trimString {
 	if($target_len >= $len || $target_len < 5) {
 		return $string;
 	}
-
 	my $chop = $len - $target_len + 3; # 3 for the ...
-
 	substr($string, ($len - $chop) / 2, $chop) = "...";
-
 	return $string;
 }
 
@@ -773,14 +891,31 @@ sub drawHeader(){
 #########################################################################################
 sub drawConnInfos(){
 	my $startrow = 6;
+	my $len;
 	foreach my $i(1..$connct){
 		my $conn = $conn[$i-1];
+
+		$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
+
+		if(!$conn->{'sock'}){	# connection closed
+			$len = pc(sprintf("%d: ", $i), 'bold white');
+			$len += pc("Connection is closed", 'bold red');
+			if($conn->{'sleep start'}){	# will be a reconnect
+				my $remain = $reconndur - (time - $conn->{'sleep start'});
+				$len += pc(sprintf(" (reconnect in %s)", hrtv($remain)), 'bold yellow');
+			}
+			print (' ' x ($wchar-$len-4));
+
+			$terminal->Tgoto('cm', 2, $startrow+(3*($i-1))+1, *STDOUT);
+			print (' ' x ($wchar-4));
+			next;
+		}
 
 		if(not $conn->{'file'}){
 			if(scalar(@queuefileset) == 0){
 				# This connection has no more work to do...
-				$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
-				my $len = pc(sprintf("%d: Nothing left to do...", $i), 'bold cyan');
+				#$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
+				$len = pc(sprintf("%d: Nothing left to do...", $i), 'bold cyan');
 				print (' ' x ($wchar-$len-4));
 				$terminal->Tgoto('cm', 2, $startrow+(3*($i-1))+1, *STDOUT);
 				$len = pc("   <waiting for others to finish>", 'bold cyan');
@@ -797,10 +932,9 @@ sub drawConnInfos(){
 		my $segbytesread = $conn->{'segbytes'};
 		my $cursegsize = @{$conn->{'file'}->{'segments'}}[$segnum-1]->{'size'};
 
-		$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
+		#$terminal->Tgoto('cm', 2, $startrow+(3*($i-1)), *STDOUT);
 
-		my $len = 
-			pc(sprintf("%d: Downloading: ", $i), 'bold white');
+		$len = pc(sprintf("%d: Downloading: ", $i), 'bold white');
 		my $fn = $file->{'name'};
 		if( length($fn) + $len > $wchar-4){
 			$fn = substr($fn, 0, $wchar-4-$len);
@@ -850,6 +984,7 @@ sub drawConnInfos(){
 sub drawStatusMsgs {
 	# TODO:  Consider saving state about status messages -- could save cycles by not
 	#        automatically drawing every time.
+	$showinghelpscreen and return;
 	my $row = 3*$connct + 6 + 1;
 	my $statuslimit = 6;	# number of lines to show.
 
@@ -952,12 +1087,33 @@ sub disconnectAll {
 	foreach my $i (1..$connct){
 		my $sock = $conn[$i-1]->{'sock'}, 
 		print "Closing down connection #$i...";
+		not $sock and print "(already closed)\n" and next;
 		send $sock, "QUIT\r\n", undef;
 		my $line = blockReadLine($sock);
 		$line =~ /^205/ and print "closed gracefully!";
 		print "\n";
 		close $sock;
 		$conn[$i-1]->{'sock'} = undef;
+	}
+}
+
+
+#########################################################################################
+# human readable time value (from seconds)
+#########################################################################################
+sub hrtv {
+	my $sec = shift;
+	if($sec < 60){
+		return $sec . "s";
+	}
+	my $h = int($sec/(60*60));
+	my $m = int(($sec - ($h*60*60))/60.0);
+	my $s = $sec - ($h*60*60) - ($m*60);
+	if($h){
+		return sprintf("%02d:%02d:%02d", $h, $m, $s);
+	}
+	else{
+		return sprintf("%02d:%02d", $m, $s);
 	}
 }
 
@@ -1041,10 +1197,13 @@ sub parseNZB {
 			my $size = $seg->getAttributes()->getNamedItem('bytes')->getValue();
 			$file{'totalsize'} += $size;
 
+			my $segNumber = $seg->getAttributes()->getNamedItem('number')->getValue();
+
 			$seghash{'msgid'} = $seg->getFirstChild()->getNodeValue();
 			$seghash{'size'} = $size;
+			$seghash{'number'} = $segNumber;
 
-			push @segments, \%seghash;
+			$segments[$segNumber-1] = \%seghash;
 		}
 		$totalsegct += scalar @segments;
 		$file{'segments'} = \@segments;
@@ -1063,6 +1222,24 @@ sub parseNZB {
 			
 	}
 	print "Loaded $totalsegct total segments for " . $files->getLength() . " file(s).\n";
+
+	if(defined($filterregex)){
+		print "Filtering files on regular expression...\n";
+		my $orgsize = scalar @fileset;
+		my @nset;
+		while(scalar(@fileset) > 0){
+			my $f = shift @fileset;
+			if( $f->{'name'} =~ /$filterregex/){
+				push @nset, $f;
+			}
+		}
+		if(scalar @nset < 1){
+			pc("\nWhoops:  Filter removed all files (nothing left)...aborting!\n\n", 'bold yellow') and exit 0;
+		}
+		printf("Kept %d of %d files (filtered %d)\n", scalar(@nset), $orgsize, $orgsize-scalar(@nset));
+		@fileset = @nset;
+	}
+
 	if($skipfilect){
 		if($skipfilect >= scalar @fileset){
 			pc("\nWhoops:  --skip $skipfilect would skip ALL " . scalar @fileset . 
@@ -1188,10 +1365,7 @@ sub getSuspectSegmentIndexes {
 }
 
 #########################################################################################
-sub dropSuspectFiles(){
-	my @newset;
-	my $dropct = 0;
-	foreach my $i (0..scalar @fileset-1){
+sub dropSuspectFiles(){ my @newset; my $dropct = 0; foreach my $i (0..scalar @fileset-1){
 		if($i == $suspectFileInd[0]){
 			my $ind = shift @suspectFileInd;
 			my $file = @fileset[$ind];
@@ -1233,22 +1407,20 @@ sub avgFilesize {
 # Parse command line options and assign sane globals etc.
 #########################################################################################
 sub handleCommandLineOptions {
-	GetOptions( 'server=s' => \$server, 'user=s' => \$user, 'pw=s' => \$pw, 
-				'help' => \$help, 'med=s' => \$medbw, 'low=s' => \$lowbw, 
-				'speed=s' => \$targkBps, 'keep' => \$keep, 'nosort' => \$nosort, 
-				'redo' => \$overwritefiles, 'conn=i' => \$connct, 
-				'nocolor' => \$nocolor, 'log=s' => \$logfile,
-				'insane' => \$insane, 'dropbad' => \$dropbad,
-				'skip=i' => \$skipfilect);
+	my @saveargs = @ARGV;
+	GetOptions(%optionsmap);
+	if(-e $configfile){
+		readConfigFileOptions();
+	}
+	else {
+		print "Config file $configfile does not exist.  Skipping.\n";
+	}
+	
+	@ARGV = @saveargs;	# restore
+	GetOptions(%optionsmap);
 	if($help){
 		showUsage();
 		exit 1;
-	}
-	if($keep){			# If keep given on commandline
-		$keep = '';		# no uudeview arg needed
-	}
-	else {				# otherwise, specify 
-		$keep = '-c';	# autoclear flag to uudeview
 	}
 	$nocolor and $usecolor = 0;
 
@@ -1273,6 +1445,26 @@ sub handleCommandLineOptions {
 		showUsage();
 		exit;
 	}
+}
+
+sub readConfigFileOptions(){
+	print "Reading config options from $configfile...\n";
+	open CFG, "<$configfile" or die "Error opening $configfile for config options";
+	my $line;
+	my @opts;
+	while($line = <CFG>){
+		chomp $line;
+		$line =~ s/^\s+//;
+		$line =~ s/^-+//;	# In case dashes in config file
+		next if $line =~ /^#/;
+		next unless length($line);
+		push @opts, "--$line";
+	}
+	close CFG;
+	my @oldarg = @ARGV;
+	@ARGV = @opts;
+	GetOptions(%optionsmap);
+	@ARGV = @oldarg;
 }
 
 #########################################################################################
@@ -1335,21 +1527,27 @@ print <<EOL
 
   where <options> are:
 
+  --config <file>   : Use <file> for config options (default is ~/.nzbperlrc)
   --server <server> : Usenet server to use (defaults to NNTPSERVER env var)
                     : Port can also be specified with --server <server:port>
   --user <user>     : Username for server (blank of not needed)
   --pw <pass>       : Password for server (blank to prompt if --user given)
   --conn <n>        : Use <n> server connections (default = 2)
-  --keep            : Keep parts files after decoding
+  --keepparts       : Keep all encoded parts files on disk after decoding
+  --keepbroken      : Continue downloading files with broken/missing segments
+                    : and leave the parts files on disk still encoded.
+  --keepbrokenbin   : Decode and keep broken decoded files (binaries) on disk.
   --redo            : Don't skip over existing downloads, do them again
   --insane          : Bypass NZB sanity checks completely
-  --dropbad         : Auto-drop NZB files with suspected broken parts
+  --dropbad         : Auto-skip files in the NZBs with suspected broken parts
   --skip <n>        : Skip the first <n> files in the nzb (don't process)
   --med <kBps>      : Set "med" bandwidth to kBps (default is 95kBps)
   --low <kBps>      : Set "low" bandwidth to kBps (default is 35kBps)
   --speed <speed>   : Explicitly specify transfer bandwidth in kBps
   --log <file>      : Log status messages into <file> (default = none)
+  --retrywait <n>   : Wait <n> seconds between reconnect tries (default = 300)
   --nosort          : Don't sort files by name before processing
+  --filter <regex>  : Filter NZB contents on <regex> in subject line
   --nocolor         : Don't use color
   --help            : Show this screen
 
