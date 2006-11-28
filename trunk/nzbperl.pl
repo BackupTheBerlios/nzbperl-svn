@@ -2437,7 +2437,9 @@ sub handleCommandLineOptions {
 	}
 
 	if($config->server =~ /:\d+$/){
-		($config->{server}, $config->{port}) = hostport($config->server);
+		my ($server, $port) = $config->hostport($config->server);
+		$config->server($server);
+		$config->port($port);
 	}
 	if(not length($config->server)){
 		$config->server($ENV{'NNTPSERVER'});
@@ -2523,7 +2525,7 @@ sub handleCommandLineOptions {
 
 	    if ($config->socks_port == -1) {
 			if($config->socks_server =~ /:\d+$/){
-				($config->{socks_server}, $config->{socks_port}) = hostport($config->socks_server);
+				($config->{socks_server}, $config->{socks_port}) = $config->hostport($config->socks_server);
 			} 
 			else {
 				(undef, undef, $config->{socks_port}, undef) = getservbyname("socks", "tcp");
@@ -2538,7 +2540,7 @@ sub handleCommandLineOptions {
 						" Please install Net::HTTPTunnel to use an HTTP proxy and try again.";
 
 		if($config->http_proxy_server =~ /:\d+$/){
-			($config->{http_proxy_server}, $config->{http_proxy_port}) = hostport($config->http_proxy_server);
+			($config->{http_proxy_server}, $config->{http_proxy_port}) = $config->hostport($config->http_proxy_server);
 		} 
 		else {
 			(undef, undef, $config->{http_proxy_port}, undef) = getservbyname("webcache", "tcp");
@@ -2556,8 +2558,7 @@ sub handleCommandLineOptions {
 }
 
 sub hostport {
-	my $class = shift;
-	my ($host, $port) = ($_[0], -1);
+	my ($class, $host, $port) = @_;
 	if($host =~ /:\d+$/){
 		$port = $host;
 		$port =~ s/.*://;
