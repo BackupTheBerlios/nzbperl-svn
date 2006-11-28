@@ -1,7 +1,6 @@
 #!/usr/bin/perl
 
 use lib '..';
-#print "\@INC is @INC\n";
 
 package SegmentTest;
 use base qw(Test::Unit::TestCase);
